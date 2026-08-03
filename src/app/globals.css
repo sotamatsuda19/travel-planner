@@ -1,0 +1,357 @@
+:root {
+  --bg: #10161d;
+  --panel: #161e27;
+  --panel-2: #1d2732;
+  --line: #2a3542;
+  --text: #e8eef5;
+  --muted: #8fa1b3;
+  --accent: #4cc2ff;
+  --accent-2: #ffb454;
+  --user: #24384d;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", "Segoe UI",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* ───────── 上下2ペイン：上=地図 / 下=会話 ───────── */
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh; /* vh ではなく dvh（モバイルのURLバー対策） */
+  width: 100%;
+}
+
+.map-pane {
+  position: relative;
+  flex: 0 0 auto;
+  min-height: 140px;
+  overflow: hidden;
+}
+
+.chat-pane {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 180px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+
+/* ドラッグで高さ配分を変えるハンドル */
+.resizer {
+  height: 10px;
+  flex: 0 0 auto;
+  cursor: row-resize;
+  background: var(--panel-2);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+.resizer::after {
+  content: "";
+  width: 46px;
+  height: 3px;
+  border-radius: 2px;
+  background: #3d4c5c;
+}
+.resizer:hover::after {
+  background: var(--accent);
+}
+
+/* ───────── 地図まわり ───────── */
+.map {
+  position: absolute;
+  inset: 0;
+}
+
+.map-overlay {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 5;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  max-width: calc(100% - 20px);
+}
+
+.chip {
+  background: rgba(16, 22, 29, 0.86);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font-size: 12px;
+  color: var(--text);
+  backdrop-filter: blur(6px);
+  white-space: nowrap;
+}
+.chip.accent {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.chip.warn {
+  border-color: var(--accent-2);
+  color: var(--accent-2);
+}
+
+.map-attr {
+  position: absolute;
+  right: 6px;
+  bottom: 4px;
+  z-index: 5;
+  font-size: 10px;
+  color: #cfe0ef;
+  background: rgba(16, 22, 29, 0.7);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.map-attr a {
+  color: #cfe0ef;
+}
+
+/* 旅程ピン（番号つき） */
+.pin-num {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--accent-2);
+  color: #1a1207;
+  font-weight: 700;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+.pin-me {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3px solid #fff;
+  box-shadow: 0 0 0 6px rgba(76, 194, 255, 0.25);
+}
+
+.maplibregl-popup-content {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+  max-width: 260px;
+}
+.maplibregl-popup-tip {
+  border-top-color: var(--panel-2) !important;
+  border-bottom-color: var(--panel-2) !important;
+}
+.popup-title {
+  font-weight: 700;
+  margin-bottom: 3px;
+}
+.popup-meta {
+  color: var(--muted);
+}
+
+/* ───────── チャット ───────── */
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+.chat-head strong {
+  color: var(--text);
+  font-size: 13px;
+}
+.chat-head button {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.chat-head button:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.chat-log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  scroll-behavior: smooth;
+}
+
+.bubble {
+  max-width: min(680px, 92%);
+  padding: 9px 13px;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bubble.user {
+  align-self: flex-end;
+  background: var(--user);
+  border: 1px solid #31465c;
+}
+.bubble.assistant {
+  align-self: flex-start;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+.bubble.tool {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px dashed var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 5px 11px;
+}
+.bubble.error {
+  align-self: flex-start;
+  background: #3a1f22;
+  border: 1px solid #6b3138;
+  color: #ffbfc6;
+  font-size: 13px;
+}
+
+.suggestions {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+  padding: 0 14px 8px;
+}
+.suggestions button {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.suggestions button:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+.composer textarea {
+  flex: 1;
+  resize: none;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  max-height: 120px;
+  min-height: 42px;
+}
+.composer textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.composer button {
+  flex: 0 0 auto;
+  background: var(--accent);
+  color: #05202c;
+  border: none;
+  border-radius: 10px;
+  padding: 0 18px;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+}
+.composer button:disabled {
+  background: #33454f;
+  color: #7e909c;
+  cursor: default;
+}
+
+.itin-strip {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 8px 14px;
+  border-top: 1px solid var(--line);
+  background: #131b23;
+}
+.itin-card {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  min-width: 120px;
+}
+.itin-card .n {
+  color: var(--accent-2);
+  font-weight: 700;
+  margin-right: 5px;
+}
+.itin-card .t {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.dots::after {
+  content: "…";
+  animation: dots 1.2s steps(4, end) infinite;
+}
+@keyframes dots {
+  0% {
+    content: "";
+  }
+  25% {
+    content: "・";
+  }
+  50% {
+    content: "・・";
+  }
+  75% {
+    content: "・・・";
+  }
+}
