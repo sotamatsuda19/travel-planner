@@ -39,18 +39,12 @@ body {
   width: 100%;
 }
 
-/* 上ペインは 左=地図 / 右=候補リスト の横並び */
+/* 地図は上ペイン全面。候補パネルはその上に浮かせる（地図を削らない） */
 .map-pane {
-  display: flex;
+  position: relative;
   flex: 0 0 auto;
   min-height: 140px;
   overflow: hidden;
-}
-
-.map-area {
-  position: relative;
-  flex: 1 1 auto;
-  min-width: 0;
 }
 
 .chat-pane {
@@ -123,11 +117,12 @@ body {
   color: var(--accent-2);
 }
 
+/* 帰属表示は必須なので、浮動パネルより前面に置いて隠れないようにする */
 .map-attr {
   position: absolute;
   right: 6px;
   bottom: 4px;
-  z-index: 5;
+  z-index: 8;
   font-size: 10px;
   color: #cfe0ef;
   background: rgba(16, 22, 29, 0.7);
@@ -138,30 +133,79 @@ body {
   color: #cfe0ef;
 }
 
-/* ───────── 候補リスト（地図の右） ───────── */
-.place-list {
-  flex: 0 0 clamp(210px, 30%, 330px);
+/* ───────── 候補パネル（地図の右に浮く） ───────── */
+.place-panel {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  bottom: 26px; /* 下端の帰属表示を覆わない */
+  z-index: 6;
+  width: min(320px, 66%);
+  display: flex;
+  flex-direction: column;
+  background: rgba(19, 26, 34, 0.93);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+
+.pp-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 6px 7px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.pp-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.pp-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.pp-body {
+  flex: 1 1 auto;
   overflow-y: auto;
   overscroll-behavior: contain;
-  background: var(--panel);
-  border-left: 1px solid var(--line);
   padding: 8px;
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.place-list-head {
-  position: sticky;
-  top: -8px;
-  z-index: 1;
-  margin: -8px -8px 0;
-  padding: 8px 12px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  color: var(--muted);
+/* 閉じているときに残るタブ */
+.place-tab {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 6;
+  background: rgba(19, 26, 34, 0.93);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--place-pin);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.place-tab:hover {
+  background: rgba(30, 40, 50, 0.95);
 }
 
 .place-card {
@@ -305,34 +349,6 @@ body {
 }
 
 /* ───────── チャット ───────── */
-.chat-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--line);
-  font-size: 12px;
-  color: var(--muted);
-}
-.chat-head strong {
-  color: var(--text);
-  font-size: 13px;
-}
-.chat-head button {
-  margin-left: auto;
-  background: none;
-  border: 1px solid var(--line);
-  color: var(--muted);
-  border-radius: 6px;
-  padding: 3px 9px;
-  font-size: 11px;
-  cursor: pointer;
-}
-.chat-head button:hover {
-  color: var(--text);
-  border-color: var(--accent);
-}
-
 .chat-log {
   flex: 1 1 auto;
   overflow-y: auto;
@@ -440,6 +456,23 @@ body {
   color: #7e909c;
   cursor: default;
 }
+/* 会話のリセット（旧ヘッダーから移設） */
+.composer .reset-btn {
+  padding: 0 12px;
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 16px;
+}
+.composer .reset-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.composer .reset-btn:disabled {
+  background: none;
+  color: #52616e;
+}
 
 .itin-strip {
   flex: 0 0 auto;
@@ -468,10 +501,12 @@ body {
   font-size: 11px;
 }
 
-/* 画面が狭いときはリストを細くして、地図が潰れないようにする */
+/* 画面が狭いときはパネルを詰めて、地図の見える面積を確保する */
 @media (max-width: 640px) {
-  .place-list {
-    flex-basis: 44%;
+  .place-panel {
+    width: min(280px, 62%);
+  }
+  .pp-body {
     padding: 6px;
   }
   .pc-desc {

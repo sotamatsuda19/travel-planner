@@ -35,18 +35,35 @@ export default function Page() {
   const [route, setRoute] = useState<RouteResult | null>(null);
   const [itinerary, setItinerary] = useState<Itinerary | null>(null);
   const [location, setLocation] = useState<LatLng | null>(null);
-  const [locLabel, setLocLabel] = useState("現在地を取得中…");
-  const [weather, setWeather] = useState<string | null>(null);
 
-  // 地図のピンとサイドリストで共有する選択状態
+  // 地図のピンと候補パネルで共有する選択状態
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // 候補パネルは地図の上に浮かせる。閉じるとタブだけが残る。
+  const [listOpen, setListOpen] = useState(true);
 
   // 上下ペインの高さ配分（地図 62% を初期値に）
   const [mapRatio, setMapRatio] = useState(0.62);
   const shellRef = useRef<HTMLDivElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
   const stickBottom = useRef(true);
+
+  const panelShown = listOpen && places.length > 0;
+
+  // パネルは地図に被さるので、その幅ぶんだけ fitBounds の右余白を広げて
+  // ピンがパネルの裏に隠れないようにする（実寸を測るので CSS 側と二重管理しない）。
+  const [padRight, setPadRight] = useState(40);
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) {
+      setPadRight(40);
+      return;
+    }
+    const ro = new ResizeObserver(() => setPadRight(Math.round(el.getBoundingClientRect().width) + 24));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [panelShown]);
 
   // ピンをクリックしたらリスト側もその場所までスクロールする
   useEffect(() => {
@@ -60,21 +77,15 @@ export default function Page() {
   const onSelect = useCallback((id: string | null) => setSelectedId(id), []);
 
   // --- 現在地 --------------------------------------------------------------
+  // 取れなければ黙って東京駅にフォールバックする（画面には出さず、必要なら会話で触れる）
   useEffect(() => {
     if (!navigator.geolocation) {
       setLocation(TOKYO);
-      setLocLabel("現在地なし（東京駅を仮の現在地に）");
       return;
     }
     navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-        setLocLabel("現在地: GPS");
-      },
-      () => {
-        setLocation(TOKYO);
-        setLocLabel("位置情報オフ（東京駅を仮の現在地に）");
-      },
+      (pos) => setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      () => setLocation(TOKYO),
       { enableHighAccuracy: false, timeout: 6000, maximumAge: 300000 },
     );
   }, []);
@@ -167,6 +178,7 @@ export default function Page() {
               case "places":
                 setPlaces(ev.places);
                 setSelectedId(null);
+                setListOpen(true); // 新しい検索結果が来たらパネルを開き直す
                 break;
               case "route":
                 setRoute(ev.route);
@@ -175,7 +187,7 @@ export default function Page() {
                 setItinerary(ev.itinerary);
                 break;
               case "context":
-                setWeather(ev.weather);
+                // 天気・現在地はモデル側の文脈にだけ効かせる（画面には出さない）
                 break;
               case "error":
                 setMessages((m) => [...m, { id: newId(), role: "error", text: ev.message }]);
@@ -210,79 +222,92 @@ export default function Page() {
 
   return (
     <div className="shell" ref={shellRef}>
-      {/* ───── 上：地図（左）＋ 候補リスト（右） ───── */}
+      {/* ───── 上：地図（全面）＋ 上に浮く候補パネル ───── */}
       <div className="map-pane" style={{ flexBasis: `${mapRatio * 100}%` }}>
-        <div className="map-area">
-          <MapPane
-            places={places}
-            route={route}
-            itinerary={itinerary}
-            location={location}
-            selectedId={selectedId}
-            onSelect={onSelect}
-          />
-          <div className="map-overlay">
-            <span className="chip">{locLabel}</span>
-            {weather && <span className="chip">天気: {weather}</span>}
-            {places.length > 0 && <span className="chip accent">検索結果 {places.length}件</span>}
-            {route && (
-              <span className="chip accent">
-                {{ walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" }[route.mode]}{" "}
-                {(route.distance_m / 1000).toFixed(1)}km / 約{Math.round(route.duration_s / 60)}分
-                {route.estimated_fare_jpy !== null && ` / 約${route.estimated_fare_jpy.toLocaleString()}円`}
-              </span>
-            )}
-            {route?.elevation_gain_m != null && (
-              <span className="chip warn">累積標高 +{route.elevation_gain_m}m</span>
-            )}
-          </div>
-        </div>
+        <MapPane
+          places={places}
+          route={route}
+          itinerary={itinerary}
+          location={location}
+          selectedId={selectedId}
+          onSelect={onSelect}
+          padRight={panelShown ? padRight : 40}
+        />
 
-        {places.length > 0 && (
-          <aside className="place-list" ref={listRef} aria-label="検索結果">
-            <div className="place-list-head">おすすめ {places.length}件</div>
-            {places.map((p, i) => (
-              <div
-                key={p.place_id}
-                role="button"
-                tabIndex={0}
-                aria-pressed={p.place_id === selectedId}
-                data-pid={p.place_id}
-                className={`place-card${p.place_id === selectedId ? " selected" : ""}`}
-                onClick={() => setSelectedId(p.place_id === selectedId ? null : p.place_id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setSelectedId(p.place_id === selectedId ? null : p.place_id);
-                  }
-                }}
-              >
-                <div className="pc-top">
-                  <span className="pc-rank">{i + 1}</span>
-                  <span className="pc-name">{p.name}</span>
-                </div>
-                <div className="pc-meta">
-                  {p.category}
-                  {p.distance_m !== null && ` ・ ${fmtDistance(p.distance_m)}`}
-                  {p.is_open_now === true && <span className="pc-open">営業中</span>}
-                  {p.is_open_now === false && <span className="pc-closed">営業時間外</span>}
-                </div>
-                {p.address && <div className="pc-meta">{p.address}</div>}
-                {p.description && <div className="pc-desc">{p.description}</div>}
+        {/* 残すのはルート要約だけ。天気・現在地・件数・累積標高は会話側に任せる。 */}
+        {route && (
+          <div className="map-overlay">
+            <span className="chip accent">
+              {{ walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" }[route.mode]}{" "}
+              {(route.distance_m / 1000).toFixed(1)}km / 約{Math.round(route.duration_s / 60)}分
+              {route.estimated_fare_jpy !== null && ` / 約${route.estimated_fare_jpy.toLocaleString()}円`}
+            </span>
+          </div>
+        )}
+
+        {places.length > 0 &&
+          (listOpen ? (
+            <aside className="place-panel" ref={panelRef} aria-label="検索結果">
+              <div className="pp-head">
+                <span>おすすめ {places.length}件</span>
                 <button
                   type="button"
-                  className="pc-ask"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setInput(`「${p.name}」について教えて`);
-                  }}
+                  className="pp-close"
+                  onClick={() => setListOpen(false)}
+                  aria-label="候補リストを閉じる"
+                  title="閉じる"
                 >
-                  詳しく聞く
+                  ×
                 </button>
               </div>
-            ))}
-          </aside>
-        )}
+              <div className="pp-body" ref={listRef}>
+                {places.map((p, i) => (
+                  <div
+                    key={p.place_id}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={p.place_id === selectedId}
+                    data-pid={p.place_id}
+                    className={`place-card${p.place_id === selectedId ? " selected" : ""}`}
+                    onClick={() => setSelectedId(p.place_id === selectedId ? null : p.place_id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setSelectedId(p.place_id === selectedId ? null : p.place_id);
+                      }
+                    }}
+                  >
+                    <div className="pc-top">
+                      <span className="pc-rank">{i + 1}</span>
+                      <span className="pc-name">{p.name}</span>
+                    </div>
+                    <div className="pc-meta">
+                      {p.category}
+                      {p.distance_m !== null && ` ・ ${fmtDistance(p.distance_m)}`}
+                      {p.is_open_now === true && <span className="pc-open">営業中</span>}
+                      {p.is_open_now === false && <span className="pc-closed">営業時間外</span>}
+                    </div>
+                    {p.address && <div className="pc-meta">{p.address}</div>}
+                    {p.description && <div className="pc-desc">{p.description}</div>}
+                    <button
+                      type="button"
+                      className="pc-ask"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setInput(`「${p.name}」について教えて`);
+                      }}
+                    >
+                      詳しく聞く
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </aside>
+          ) : (
+            <button type="button" className="place-tab" onClick={() => setListOpen(true)}>
+              候補 {places.length}件
+            </button>
+          ))}
       </div>
 
       {/* ───── 仕切り（ドラッグで高さ配分を変更） ───── */}
@@ -290,14 +315,6 @@ export default function Page() {
 
       {/* ───── 下：会話 ───── */}
       <div className="chat-pane">
-        <div className="chat-head">
-          <strong>旅のプランナー</strong>
-          <span>Claude Opus 5 × オープンデータ</span>
-          <button onClick={reset} disabled={busy}>
-            会話をリセット
-          </button>
-        </div>
-
         <div className="chat-log" ref={logRef} onScroll={onLogScroll}>
           {messages.length === 0 && (
             <div className="bubble assistant">
@@ -362,6 +379,17 @@ export default function Page() {
           />
           <button type="submit" disabled={busy || !input.trim()}>
             送信
+          </button>
+          {/* ヘッダーを畳んだので、リセットはここに small button として残す */}
+          <button
+            type="button"
+            className="reset-btn"
+            onClick={reset}
+            disabled={busy}
+            title="会話をリセット"
+            aria-label="会話をリセット"
+          >
+            ↺
           </button>
         </form>
       </div>

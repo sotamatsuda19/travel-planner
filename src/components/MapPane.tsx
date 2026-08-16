@@ -54,12 +54,22 @@ type Props = {
   route: RouteResult | null;
   itinerary: Itinerary | null;
   location: LatLng | null;
-  /** 選択中の place_id（サイドリストと共有する） */
+  /** 選択中の place_id（候補パネルと共有する） */
   selectedId: string | null;
   onSelect: (placeId: string | null) => void;
+  /** 候補パネルが地図に被さっている幅。fitBounds の右余白に使う。 */
+  padRight: number;
 };
 
-export default function MapPane({ places, route, itinerary, location, selectedId, onSelect }: Props) {
+export default function MapPane({
+  places,
+  route,
+  itinerary,
+  location,
+  selectedId,
+  onSelect,
+  padRight,
+}: Props) {
   const holder = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MLMap | null>(null);
   const ready = useRef(false);
@@ -77,7 +87,8 @@ export default function MapPane({ places, route, itinerary, location, selectedId
       zoom: 12.2,
       attributionControl: false,
     });
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    // 右上は候補パネルが被さるので、ズームは左下に置く
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-left");
     mapRef.current = map;
 
     // ピンの選択に連動して開閉する共有ポップアップ（マーカーごとには持たせない）
@@ -270,9 +281,6 @@ export default function MapPane({ places, route, itinerary, location, selectedId
     for (const p of places) pts.push([p.lng, p.lat]);
     if (pts.length === 0) return;
 
-    // サイドリストの出入りでキャンバス幅が変わった直後なので、寸法を確定させてから fit する
-    map.resize();
-
     let [minX, minY, maxX, maxY] = [Infinity, Infinity, -Infinity, -Infinity];
     for (const [x, y] of pts) {
       minX = Math.min(minX, x);
@@ -285,13 +293,25 @@ export default function MapPane({ places, route, itinerary, location, selectedId
       [maxX, maxY],
     ];
 
-    if (pts.length === 1) {
-      map.easeTo({ center: pts[0], zoom: 15.5, duration: 700 });
-      return;
-    }
-    // ピンは座標の真上に立つので、上側の余白を厚めに取る。
-    map.fitBounds(bounds, { padding: { top: 76, bottom: 40, left: 40, right: 40 }, maxZoom: 16.5, duration: 800 });
-  }, [places, route, itinerary]);
+    // 検索結果の到着とパネル幅の確定は別のタイミングで来る。1フレーム待って
+    // 最後の1回だけ動かし、連続 fit でカメラがガタつくのを防ぐ。
+    const frame = requestAnimationFrame(() => {
+      map.resize();
+      if (pts.length === 1) {
+        map.easeTo({ center: pts[0], zoom: 15.5, duration: 700 });
+        return;
+      }
+      // ピンは座標の真上に立つので上側は厚めに。右はパネルに被されるぶんを空ける。
+      // 余白がキャンバスを食い潰すと fitBounds が破綻するので上限を掛ける。
+      const w = map.getCanvas().clientWidth;
+      map.fitBounds(bounds, {
+        padding: { top: 60, bottom: 40, left: 40, right: Math.min(padRight, Math.max(40, w * 0.55)) },
+        maxZoom: 16.5,
+        duration: 800,
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [places, route, itinerary, padRight]);
 
   return (
     <>
