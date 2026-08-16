@@ -11,31 +11,60 @@ import type { Itinerary, LatLng, Place, RouteResult } from "@/lib/types";
  * search_places / get_route / save_itinerary の結果がそのままここに流れてくる。
  *
  * タイル: OpenFreeMap（OpenMapTiles スキーマのベクタタイル / OSM 由来・APIキー不要・無料）
- * ラスタではなくベクタなので、ズームしてもラベルが潰れず、ダークテーマとして設計された配色が使える。
+ * ラスタではなくベクタなので、ズームしてもラベルが潰れない。
  */
 
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/dark";
+const MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 
+/** ライトなベースマップの上でも沈まない濃さに揃える */
 const MODE_COLOR: Record<string, string> = {
-  walk: "#4cc2ff",
-  transit: "#7ee787",
-  taxi: "#ffb454",
-  car: "#ff8f6b",
+  walk: "#1a73e8",
+  transit: "#188038",
+  taxi: "#e8710a",
+  car: "#c5221f",
 };
+
+const PLACE_PIN = "#ea4335"; // Google マップでおなじみの赤
+const ITIN_PIN = "#f9ab00"; // 旅程に入ったものは琥珀色
+
+/**
+ * 雫型ピン。marker の anchor: "bottom" と組み合わせて、先端が座標を指すようにする。
+ * 白い縁取りを付けているのは、道路・建物・水域のどの上に載っても輪郭が消えないようにするため。
+ */
+function pinSvg(fill: string, label?: string): string {
+  const inner = label
+    ? `<circle cx="12" cy="12" r="7.2" fill="#fff"/>` +
+      `<text x="12" y="12" text-anchor="middle" dominant-baseline="central"` +
+      ` font-family="system-ui, -apple-system, sans-serif"` +
+      ` font-size="${label.length > 1 ? 10 : 12}" font-weight="700" fill="#20262e">${label}</text>`
+    : `<circle cx="12" cy="12" r="4.2" fill="#fff"/>`;
+  return (
+    `<svg width="26" height="36" viewBox="-1 -1 26 36" xmlns="http://www.w3.org/2000/svg">` +
+    `<path d="M12 0C5.373 0 0 5.373 0 12c0 8.4 10.2 20.2 11.06 21.18a1.25 1.25 0 0 0 1.88 0C13.8 32.2 24 20.4 24 12 24 5.373 18.627 0 12 0z"` +
+    ` fill="${fill}" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>` +
+    inner +
+    `</svg>`
+  );
+}
+
+type Entry = { marker: maplibregl.Marker; inner: HTMLElement; html: string; lngLat: [number, number] };
 
 type Props = {
   places: Place[];
   route: RouteResult | null;
   itinerary: Itinerary | null;
   location: LatLng | null;
-  onPickPlace: (place: Place) => void;
+  /** 選択中の place_id（サイドリストと共有する） */
+  selectedId: string | null;
+  onSelect: (placeId: string | null) => void;
 };
 
-export default function MapPane({ places, route, itinerary, location, onPickPlace }: Props) {
+export default function MapPane({ places, route, itinerary, location, selectedId, onSelect }: Props) {
   const holder = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MLMap | null>(null);
   const ready = useRef(false);
-  const markers = useRef<maplibregl.Marker[]>([]);
+  const entries = useRef<Map<string, Entry>>(new Map());
+  const popup = useRef<maplibregl.Popup | null>(null);
   const meMarker = useRef<maplibregl.Marker | null>(null);
 
   // --- 初期化 ---------------------------------------------------------------
@@ -51,6 +80,9 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     mapRef.current = map;
 
+    // ピンの選択に連動して開閉する共有ポップアップ（マーカーごとには持たせない）
+    popup.current = new maplibregl.Popup({ offset: 30, closeButton: false, closeOnClick: false });
+
     map.on("load", () => {
       map.addSource("route", {
         type: "geojson",
@@ -64,7 +96,7 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
           type: "line",
           source: "route",
           layout: { "line-cap": "round", "line-join": "round" },
-          paint: { "line-color": "#05090d", "line-width": 10, "line-opacity": 0.85 },
+          paint: { "line-color": "#ffffff", "line-width": 10, "line-opacity": 0.9 },
         },
         firstLabel,
       );
@@ -75,8 +107,8 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
           source: "route",
           layout: { "line-cap": "round", "line-join": "round" },
           paint: {
-            "line-color": ["coalesce", ["get", "color"], "#4cc2ff"],
-            "line-width": 4.5,
+            "line-color": ["coalesce", ["get", "color"], MODE_COLOR.walk],
+            "line-width": 5,
           },
         },
         firstLabel,
@@ -84,7 +116,10 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
       ready.current = true;
     });
 
-    // ペイン高さが変わったら resize（上下分割なので必須 / roadmap §1.5-2）
+    // 地図の余白をクリックしたら選択解除
+    map.on("click", () => onSelect(null));
+
+    // ペイン高さ・サイドリストの出入りで幅が変わったら resize（roadmap §1.5-2）
     const ro = new ResizeObserver(() => map.resize());
     ro.observe(holder.current);
 
@@ -93,7 +128,10 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
       map.remove();
       mapRef.current = null;
       ready.current = false;
+      entries.current.clear();
     };
+    // onSelect は page 側で useCallback 済み（ここで再初期化させない）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // --- 現在地 ---------------------------------------------------------------
@@ -114,56 +152,88 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
     const map = mapRef.current;
     if (!map) return;
 
-    for (const m of markers.current) m.remove();
-    markers.current = [];
+    for (const e of entries.current.values()) e.marker.remove();
+    entries.current.clear();
+
+    const add = (id: string, lngLat: [number, number], svg: string, html: string, cls: string) => {
+      // maplibre は marker の element 自体に transform を当てるので、
+      // 拡大用の transform は内側の要素に分けて持たせる。
+      const wrap = document.createElement("div");
+      wrap.className = "pin-wrap";
+      const inner = document.createElement("div");
+      inner.className = cls;
+      inner.innerHTML = svg;
+      wrap.appendChild(inner);
+      wrap.addEventListener("click", (ev) => {
+        ev.stopPropagation(); // 地図クリック（＝選択解除）に伝播させない
+        onSelect(id);
+      });
+      const marker = new maplibregl.Marker({ element: wrap, anchor: "bottom" })
+        .setLngLat(lngLat)
+        .addTo(map);
+      entries.current.set(id, { marker, inner, html, lngLat });
+    };
 
     const itinItems = itinerary?.days.flatMap((d) => d.items) ?? [];
     const itinIds = new Set(itinItems.map((i) => i.place_id));
 
-    // 検索結果：薄いピン（旅程に入っているものは番号ピン側で描くので除外）
+    // 検索結果：赤いピン（旅程に入っているものは番号ピン側で描くので除外）
     for (const p of places) {
       if (itinIds.has(p.place_id)) continue;
-      const el = document.createElement("div");
-      el.style.cssText =
-        "width:12px;height:12px;border-radius:50%;background:#4cc2ff;border:2px solid #0f151b;box-shadow:0 0 0 1px #4cc2ff;cursor:pointer";
-      const marker = new maplibregl.Marker({ element: el })
-        .setLngLat([p.lng, p.lat])
-        .setPopup(
-          new maplibregl.Popup({ offset: 14, closeButton: false }).setHTML(
-            popupHtml(p.name, [
-              p.category,
-              p.address ?? "",
-              p.is_open_now === true ? "営業中" : p.is_open_now === false ? "営業時間外" : "",
-              p.opening_hours ?? "",
-              p.description ?? "",
-            ]),
-          ),
-        )
-        .addTo(map);
-      el.addEventListener("click", () => onPickPlace(p));
-      markers.current.push(marker);
+      add(
+        p.place_id,
+        [p.lng, p.lat],
+        pinSvg(PLACE_PIN),
+        popupHtml(p.name, [
+          p.category,
+          p.address ?? "",
+          p.is_open_now === true ? "営業中" : p.is_open_now === false ? "営業時間外" : "",
+          p.opening_hours ?? "",
+          p.description ?? "",
+        ]),
+        "pin-place",
+      );
     }
 
-    // 旅程：番号つきの濃いピン（roadmap §5 原則2「旅程に入っているかで描き分ける」）
+    // 旅程：番号つきの琥珀ピン（roadmap §5 原則2「旅程に入っているかで描き分ける」）
     itinItems.forEach((item, i) => {
-      const el = document.createElement("div");
-      el.className = "pin-num";
-      el.textContent = String(i + 1);
-      const marker = new maplibregl.Marker({ element: el })
-        .setLngLat([item.lng, item.lat])
-        .setPopup(
-          new maplibregl.Popup({ offset: 18, closeButton: false }).setHTML(
-            popupHtml(`${i + 1}. ${item.name}`, [
-              item.start_time ? `${item.start_time}〜` : "",
-              item.duration_min ? `滞在 ${item.duration_min}分` : "",
-              item.note ?? "",
-            ]),
-          ),
-        )
-        .addTo(map);
-      markers.current.push(marker);
+      add(
+        item.place_id,
+        [item.lng, item.lat],
+        pinSvg(ITIN_PIN, String(i + 1)),
+        popupHtml(`${i + 1}. ${item.name}`, [
+          item.start_time ? `${item.start_time}〜` : "",
+          item.duration_min ? `滞在 ${item.duration_min}分` : "",
+          item.note ?? "",
+        ]),
+        "pin-place pin-itin",
+      );
     });
-  }, [places, itinerary, onPickPlace]);
+  }, [places, itinerary, onSelect]);
+
+  // --- 選択の反映（拡大 + 前面 + ポップアップ） --------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    const pop = popup.current;
+    if (!map || !pop) return;
+
+    for (const [id, e] of entries.current) {
+      const on = id === selectedId;
+      e.inner.classList.toggle("selected", on);
+      (e.marker.getElement() as HTMLElement).style.zIndex = on ? "3" : "";
+    }
+
+    const sel = selectedId ? entries.current.get(selectedId) : null;
+    if (!sel) {
+      pop.remove();
+      return;
+    }
+    pop.setLngLat(sel.lngLat).setHTML(sel.html).addTo(map);
+    // 画面外に居るときだけ寄せる。見えているものを動かすと視線を失うので動かさない。
+    if (!map.getBounds().contains(sel.lngLat)) {
+      map.easeTo({ center: sel.lngLat, duration: 500 });
+    }
+  }, [selectedId, places, itinerary]);
 
   // --- ルート ---------------------------------------------------------------
   useEffect(() => {
@@ -178,7 +248,7 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
           ? [
               {
                 type: "Feature",
-                properties: { color: MODE_COLOR[route.mode] ?? "#4cc2ff" },
+                properties: { color: MODE_COLOR[route.mode] ?? MODE_COLOR.walk },
                 geometry: { type: "LineString", coordinates: route.polyline },
               },
             ]
@@ -200,6 +270,9 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
     for (const p of places) pts.push([p.lng, p.lat]);
     if (pts.length === 0) return;
 
+    // サイドリストの出入りでキャンバス幅が変わった直後なので、寸法を確定させてから fit する
+    map.resize();
+
     let [minX, minY, maxX, maxY] = [Infinity, Infinity, -Infinity, -Infinity];
     for (const [x, y] of pts) {
       minX = Math.min(minX, x);
@@ -216,8 +289,8 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
       map.easeTo({ center: pts[0], zoom: 15.5, duration: 700 });
       return;
     }
-    // 上下分割なのでチャットに隠れる心配はない。ラベル分だけ上に余白を取る。
-    map.fitBounds(bounds, { padding: { top: 60, bottom: 40, left: 40, right: 40 }, maxZoom: 16.5, duration: 800 });
+    // ピンは座標の真上に立つので、上側の余白を厚めに取る。
+    map.fitBounds(bounds, { padding: { top: 76, bottom: 40, left: 40, right: 40 }, maxZoom: 16.5, duration: 800 });
   }, [places, route, itinerary]);
 
   return (
@@ -229,7 +302,10 @@ export default function MapPane({ places, route, itinerary, location, onPickPlac
         <a href="https://openmaptiles.org/" target="_blank" rel="noreferrer">OpenMapTiles</a>
         {" / "}
         <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a>
-        {" / "}スポット: OSM, Wikidata, Wikivoyage
+        {" / "}スポット:{" "}
+        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OSM</a>,{" "}
+        <a href="https://www.wikidata.org/" target="_blank" rel="noreferrer">Wikidata</a>,{" "}
+        <a href="https://ja.wikivoyage.org/" target="_blank" rel="noreferrer">Wikivoyage</a>
       </div>
     </>
   );

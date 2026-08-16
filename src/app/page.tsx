@@ -21,6 +21,8 @@ const SUGGESTIONS = [
 
 const newId = () => Math.random().toString(36).slice(2);
 
+const fmtDistance = (m: number) => (m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`);
+
 export default function Page() {
   // セッションIDはページを開くたびに新しく振る＝リロードで会話がリセットされる。
   // サーバ側の履歴は Supabase に残るので、後からログとして読める。
@@ -36,11 +38,26 @@ export default function Page() {
   const [locLabel, setLocLabel] = useState("現在地を取得中…");
   const [weather, setWeather] = useState<string | null>(null);
 
+  // 地図のピンとサイドリストで共有する選択状態
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
   // 上下ペインの高さ配分（地図 62% を初期値に）
   const [mapRatio, setMapRatio] = useState(0.62);
   const shellRef = useRef<HTMLDivElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const stickBottom = useRef(true);
+
+  // ピンをクリックしたらリスト側もその場所までスクロールする
+  useEffect(() => {
+    if (!selectedId || !listRef.current) return;
+    listRef.current
+      .querySelector(`[data-pid="${CSS.escape(selectedId)}"]`)
+      ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [selectedId]);
+
+  // MapPane 側の初期化 effect が握る参照なので、識別子を安定させる
+  const onSelect = useCallback((id: string | null) => setSelectedId(id), []);
 
   // --- 現在地 --------------------------------------------------------------
   useEffect(() => {
@@ -149,6 +166,7 @@ export default function Page() {
                 break;
               case "places":
                 setPlaces(ev.places);
+                setSelectedId(null);
                 break;
               case "route":
                 setRoute(ev.route);
@@ -185,36 +203,86 @@ export default function Page() {
     setPlaces([]);
     setRoute(null);
     setItinerary(null);
+    setSelectedId(null);
   };
 
   const itinItems = itinerary?.days.flatMap((d) => d.items) ?? [];
 
   return (
     <div className="shell" ref={shellRef}>
-      {/* ───── 上：地図 ───── */}
+      {/* ───── 上：地図（左）＋ 候補リスト（右） ───── */}
       <div className="map-pane" style={{ flexBasis: `${mapRatio * 100}%` }}>
-        <MapPane
-          places={places}
-          route={route}
-          itinerary={itinerary}
-          location={location}
-          onPickPlace={(p) => setInput(`「${p.name}」について教えて`)}
-        />
-        <div className="map-overlay">
-          <span className="chip">{locLabel}</span>
-          {weather && <span className="chip">天気: {weather}</span>}
-          {places.length > 0 && <span className="chip accent">検索結果 {places.length}件</span>}
-          {route && (
-            <span className="chip accent">
-              {{ walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" }[route.mode]}{" "}
-              {(route.distance_m / 1000).toFixed(1)}km / 約{Math.round(route.duration_s / 60)}分
-              {route.estimated_fare_jpy !== null && ` / 約${route.estimated_fare_jpy.toLocaleString()}円`}
-            </span>
-          )}
-          {route?.elevation_gain_m != null && (
-            <span className="chip warn">累積標高 +{route.elevation_gain_m}m</span>
-          )}
+        <div className="map-area">
+          <MapPane
+            places={places}
+            route={route}
+            itinerary={itinerary}
+            location={location}
+            selectedId={selectedId}
+            onSelect={onSelect}
+          />
+          <div className="map-overlay">
+            <span className="chip">{locLabel}</span>
+            {weather && <span className="chip">天気: {weather}</span>}
+            {places.length > 0 && <span className="chip accent">検索結果 {places.length}件</span>}
+            {route && (
+              <span className="chip accent">
+                {{ walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" }[route.mode]}{" "}
+                {(route.distance_m / 1000).toFixed(1)}km / 約{Math.round(route.duration_s / 60)}分
+                {route.estimated_fare_jpy !== null && ` / 約${route.estimated_fare_jpy.toLocaleString()}円`}
+              </span>
+            )}
+            {route?.elevation_gain_m != null && (
+              <span className="chip warn">累積標高 +{route.elevation_gain_m}m</span>
+            )}
+          </div>
         </div>
+
+        {places.length > 0 && (
+          <aside className="place-list" ref={listRef} aria-label="検索結果">
+            <div className="place-list-head">おすすめ {places.length}件</div>
+            {places.map((p, i) => (
+              <div
+                key={p.place_id}
+                role="button"
+                tabIndex={0}
+                aria-pressed={p.place_id === selectedId}
+                data-pid={p.place_id}
+                className={`place-card${p.place_id === selectedId ? " selected" : ""}`}
+                onClick={() => setSelectedId(p.place_id === selectedId ? null : p.place_id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setSelectedId(p.place_id === selectedId ? null : p.place_id);
+                  }
+                }}
+              >
+                <div className="pc-top">
+                  <span className="pc-rank">{i + 1}</span>
+                  <span className="pc-name">{p.name}</span>
+                </div>
+                <div className="pc-meta">
+                  {p.category}
+                  {p.distance_m !== null && ` ・ ${fmtDistance(p.distance_m)}`}
+                  {p.is_open_now === true && <span className="pc-open">営業中</span>}
+                  {p.is_open_now === false && <span className="pc-closed">営業時間外</span>}
+                </div>
+                {p.address && <div className="pc-meta">{p.address}</div>}
+                {p.description && <div className="pc-desc">{p.description}</div>}
+                <button
+                  type="button"
+                  className="pc-ask"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setInput(`「${p.name}」について教えて`);
+                  }}
+                >
+                  詳しく聞く
+                </button>
+              </div>
+            ))}
+          </aside>
+        )}
       </div>
 
       {/* ───── 仕切り（ドラッグで高さ配分を変更） ───── */}
