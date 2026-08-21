@@ -1,13 +1,18 @@
 import { haversine, nearestStation } from "./poi";
+import { findRailRoute, railAvailable } from "./rail";
 import type { LatLng, RouteLeg, RouteResult, TravelMode } from "./types";
 
 /**
  * 経路探索。
  *   - walk / car / taxi : OSRM（あれば）→ 失敗したら直線近似にフォールバック
- *   - transit           : 最寄り駅どうしを結ぶ近似（徒歩→電車→徒歩）
+ *   - transit           : 国土数値情報 N02 の駅グラフで実際の線路の上を通す
+ *                         （data/rail.json が無ければ従来の直線近似に落ちる）
  *
  * roadmap §5 原則3「ツールを増やす代わりに返り値を厚くする」に従い、
  * 料金・累積標高・区間内訳をすべてこの返り値に載せる。
+ *
+ * 区間（leg）は線形 polyline を持つ。地図はルート全体ではなく leg 単位で描くので、
+ * 「徒歩は点線・鉄道は路線カラー」の描き分けがここで決まる。
  */
 
 const OSRM_BASE = process.env.OSRM_URL ?? "https://router.project-osrm.org";
@@ -25,6 +30,9 @@ const SPEED_MPS: Record<TravelMode, number> = {
 /** 直線距離 → 実際の道のりの補正係数（都市部） */
 const DETOUR = 1.28;
 
+/** これより近ければ電車を使わず歩く */
+const TRANSIT_MIN_M = 1200;
+
 // ------------------------------------------------------------------- 料金
 
 /** 東京都の一般的なタクシー運賃（初乗り500円/1.096km、以降255mごと100円 + 時間距離併用の概算） */
@@ -39,7 +47,7 @@ export function taxiFare(distanceM: number, durationS: number): number {
   return base + extra + timeCharge;
 }
 
-/** 鉄道運賃のざっくり見積り（距離帯別） */
+/** 鉄道運賃のざっくり見積り（距離帯別）。駅グラフが無いときのフォールバック用。 */
 export function trainFare(distanceM: number): number {
   const km = distanceM / 1000;
   if (km <= 3) return 170;
@@ -90,6 +98,33 @@ async function osrmRoute(
   } catch {
     return null; // ネットワーク不通・タイムアウト時は近似にフォールバック
   }
+}
+
+/**
+ * OSRM は経路全体の線形しか返さないので、経由地に一番近い頂点で切り分ける。
+ * 厳密な leg 境界ではないが、描き分けの用途には十分。
+ */
+function splitAtWaypoints(polyline: [number, number][], stops: Stop[]): [number, number][][] {
+  if (stops.length <= 2 || polyline.length < 2) return [polyline];
+  const cuts = [0];
+  let from = 0;
+  for (let i = 1; i < stops.length - 1; i++) {
+    let best = from;
+    let bestD = Infinity;
+    for (let j = from; j < polyline.length; j++) {
+      const d = haversine({ lat: polyline[j][1], lng: polyline[j][0] }, stops[i]);
+      if (d < bestD) {
+        bestD = d;
+        best = j;
+      }
+    }
+    cuts.push(Math.max(best, from + 1));
+    from = cuts[cuts.length - 1];
+  }
+  cuts.push(polyline.length - 1);
+  const out: [number, number][][] = [];
+  for (let i = 0; i < cuts.length - 1; i++) out.push(polyline.slice(cuts[i], cuts[i + 1] + 1));
+  return out;
 }
 
 // ------------------------------------------------------------- 標高（国土地理院）
@@ -144,6 +179,49 @@ function interpolate(a: Stop, b: Stop, n = 12): [number, number][] {
   return out;
 }
 
+/** 徒歩区間。OSRM が使えれば道なりに、駄目なら直線に落とす。 */
+async function walkLeg(a: Stop, b: Stop, note: string | null): Promise<RouteLeg> {
+  const osrm = await osrmRoute([a, b], "walk");
+  if (osrm) {
+    return {
+      from: a.name,
+      to: b.name,
+      mode: "walk",
+      distance_m: osrm.distance_m,
+      duration_s: osrm.duration_s,
+      note,
+      polyline: osrm.polyline,
+      operator: null,
+      line: null,
+      color: null,
+    };
+  }
+  const seg = straightSegment(a, b, "walk");
+  return {
+    from: a.name,
+    to: b.name,
+    mode: "walk",
+    distance_m: seg.distance,
+    duration_s: seg.duration,
+    note: note ? `${note}（直線距離からの概算）` : "直線距離からの概算",
+    polyline: interpolate(a, b),
+    operator: null,
+    line: null,
+    color: null,
+  };
+}
+
+/** leg の線形を繋いで1本にする（カメラの fit と標高サンプリングに使う） */
+function joinLegs(legs: RouteLeg[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (const l of legs) {
+    if (l.polyline.length === 0) continue;
+    if (out.length === 0) out.push(...l.polyline);
+    else out.push(...l.polyline.slice(1));
+  }
+  return out;
+}
+
 // -------------------------------------------------------------------- 本体
 
 export async function buildRoute(stops: Stop[], mode: TravelMode): Promise<RouteResult> {
@@ -153,16 +231,15 @@ export async function buildRoute(stops: Stop[], mode: TravelMode): Promise<Route
 
   const osrm = await osrmRoute(stops, mode);
   const legs: RouteLeg[] = [];
-  let polyline: [number, number][] = [];
   let distance = 0;
   let duration = 0;
   let engine = "straight-line-estimate";
 
   if (osrm) {
     engine = "OSRM";
-    polyline = osrm.polyline;
     distance = osrm.distance_m;
     duration = osrm.duration_s;
+    const parts = splitAtWaypoints(osrm.polyline, stops);
     osrm.legs.forEach((l, i) => {
       legs.push({
         from: stops[i].name,
@@ -171,6 +248,10 @@ export async function buildRoute(stops: Stop[], mode: TravelMode): Promise<Route
         distance_m: Math.round(l.distance),
         duration_s: Math.round(l.duration),
         note: null,
+        polyline: parts[i] ?? [],
+        operator: null,
+        line: null,
+        color: null,
       });
     });
   } else {
@@ -178,7 +259,6 @@ export async function buildRoute(stops: Stop[], mode: TravelMode): Promise<Route
       const seg = straightSegment(stops[i], stops[i + 1], mode);
       distance += seg.distance;
       duration += seg.duration;
-      polyline.push(...interpolate(stops[i], stops[i + 1]));
       legs.push({
         from: stops[i].name,
         to: stops[i + 1].name,
@@ -186,10 +266,15 @@ export async function buildRoute(stops: Stop[], mode: TravelMode): Promise<Route
         distance_m: seg.distance,
         duration_s: seg.duration,
         note: "直線距離からの概算",
+        polyline: interpolate(stops[i], stops[i + 1]),
+        operator: null,
+        line: null,
+        color: null,
       });
     }
   }
 
+  const polyline = osrm ? osrm.polyline : joinLegs(legs);
   const elevation = mode === "walk" ? await elevationGain(polyline) : null;
 
   return {
@@ -205,53 +290,98 @@ export async function buildRoute(stops: Stop[], mode: TravelMode): Promise<Route
   };
 }
 
-/** 徒歩 → 最寄り駅 → 電車 → 最寄り駅 → 徒歩 の近似 */
+/**
+ * 徒歩 → 電車（実際の線路の上）→ 徒歩。
+ * 駅グラフが使えないときだけ、従来どおり最寄り駅を直線で結ぶ近似に落ちる。
+ */
 async function transitRoute(stops: Stop[]): Promise<RouteResult> {
   const legs: RouteLeg[] = [];
-  const polyline: [number, number][] = [];
-  let distance = 0;
-  let duration = 0;
   let fare = 0;
+  let engine = "station-graph-estimate (OSM railway_station)";
+  let usedRail = false;
 
   for (let i = 0; i < stops.length - 1; i++) {
     const from = stops[i];
     const to = stops[i + 1];
+    const straight = haversine({ lat: from.lat, lng: from.lng }, { lat: to.lat, lng: to.lng });
+
+    // 近すぎるなら歩いた方が早い
+    if (straight * DETOUR < TRANSIT_MIN_M) {
+      legs.push(await walkLeg(from, to, "近いので徒歩"));
+      continue;
+    }
+
+    const plan = railAvailable()
+      ? findRailRoute({ lat: from.lat, lng: from.lng }, { lat: to.lat, lng: to.lng })
+      : null;
+
+    if (plan && plan.legs.some((l) => !l.walk)) {
+      usedRail = true;
+      engine = plan.source;
+      fare += plan.fare_jpy;
+
+      // 出発地 → 乗車駅
+      if (plan.board.access_m > 60) {
+        legs.push(
+          await walkLeg(from, { name: `${plan.board.name}駅`, lat: plan.board.lat, lng: plan.board.lng }, null),
+        );
+      }
+
+      for (const rl of plan.legs) {
+        legs.push({
+          from: `${rl.fromStation}駅`,
+          to: `${rl.toStation}駅`,
+          mode: rl.walk ? "walk" : "transit",
+          distance_m: Math.round(rl.distance_m),
+          duration_s: Math.round(rl.duration_s),
+          note: rl.walk
+            ? "駅間の徒歩乗換"
+            : `${rl.operator} ${rl.line} / ${rl.stops}駅`,
+          polyline: rl.polyline,
+          operator: rl.walk ? null : rl.operator,
+          line: rl.walk ? null : rl.line,
+          color: rl.walk ? null : rl.color,
+        });
+      }
+
+      // 降車駅 → 目的地
+      if (plan.alight.access_m > 60) {
+        legs.push(
+          await walkLeg({ name: `${plan.alight.name}駅`, lat: plan.alight.lat, lng: plan.alight.lng }, to, null),
+        );
+      }
+      continue;
+    }
+
+    // ---- フォールバック: 最寄り駅どうしを直線で結ぶ（従来の近似）----
     const fromStation = nearestStation({ lat: from.lat, lng: from.lng });
     const toStation = nearestStation({ lat: to.lat, lng: to.lng });
-
-    const direct = straightSegment(from, to, "walk");
-    // 近すぎる（1.2km未満）なら歩いた方が早い
-    if (!fromStation || !toStation || fromStation.display === toStation.display || direct.distance < 1200) {
-      distance += direct.distance;
-      duration += direct.duration;
-      polyline.push(...interpolate(from, to));
-      legs.push({
-        from: from.name,
-        to: to.name,
-        mode: "walk",
-        distance_m: direct.distance,
-        duration_s: direct.duration,
-        note: "近いので徒歩",
-      });
+    if (!fromStation || !toStation || fromStation.display === toStation.display) {
+      legs.push(await walkLeg(from, to, "近いので徒歩"));
       continue;
     }
 
     const sFrom: Stop = { name: fromStation.display, lat: fromStation.lat, lng: fromStation.lon };
     const sTo: Stop = { name: toStation.display, lat: toStation.lat, lng: toStation.lon };
-
     const walkA = straightSegment(from, sFrom, "walk");
     const train = straightSegment(sFrom, sTo, "transit");
     const walkB = straightSegment(sTo, to, "walk");
-    const waitS = 240; // 待ち時間 + 乗り換え
-
-    polyline.push(...interpolate(from, sFrom), ...interpolate(sFrom, sTo, 24), ...interpolate(sTo, to));
-    distance += walkA.distance + train.distance + walkB.distance;
-    duration += walkA.duration + train.duration + walkB.duration + waitS;
+    const waitS = 240;
     fare += trainFare(train.distance);
 
-    // 目的地が駅そのもの等で徒歩区間が無い場合は、その leg を出さない
     if (walkA.distance > 60) {
-      legs.push({ from: from.name, to: sFrom.name, mode: "walk", distance_m: walkA.distance, duration_s: walkA.duration, note: null });
+      legs.push({
+        from: from.name,
+        to: sFrom.name,
+        mode: "walk",
+        distance_m: walkA.distance,
+        duration_s: walkA.duration,
+        note: null,
+        polyline: interpolate(from, sFrom),
+        operator: null,
+        line: null,
+        color: null,
+      });
     }
     legs.push({
       from: sFrom.name,
@@ -259,22 +389,41 @@ async function transitRoute(stops: Stop[]): Promise<RouteResult> {
       mode: "transit",
       distance_m: train.distance,
       duration_s: train.duration + waitS,
-      note: `${fromStation.operator ?? "鉄道"} ほか（待ち時間込みの概算）`,
+      note: `${fromStation.operator ?? "鉄道"} ほか（直線距離からの概算）`,
+      polyline: interpolate(sFrom, sTo, 24),
+      operator: fromStation.operator,
+      line: null,
+      color: null,
     });
     if (walkB.distance > 60) {
-      legs.push({ from: sTo.name, to: to.name, mode: "walk", distance_m: walkB.distance, duration_s: walkB.duration, note: null });
+      legs.push({
+        from: sTo.name,
+        to: to.name,
+        mode: "walk",
+        distance_m: walkB.distance,
+        duration_s: walkB.duration,
+        note: null,
+        polyline: interpolate(sTo, to),
+        operator: null,
+        line: null,
+        color: null,
+      });
     }
   }
 
+  // 乗換の待ち時間は leg の外側に乗るので、ここで足す
+  const railLegCount = legs.filter((l) => l.mode === "transit").length;
+  const overhead = usedRail ? 150 + Math.max(0, railLegCount - 1) * 240 : 0;
+
   return {
     mode: "transit",
-    polyline,
-    distance_m: distance,
-    duration_s: duration,
+    polyline: joinLegs(legs),
+    distance_m: legs.reduce((s, l) => s + l.distance_m, 0),
+    duration_s: legs.reduce((s, l) => s + l.duration_s, 0) + overhead,
     legs,
     estimated_fare_jpy: fare || null,
     elevation_gain_m: null,
     waypoints: stops.map((s) => ({ name: s.name, lat: s.lat, lng: s.lng })),
-    engine: "station-graph-estimate (OSM railway_station)",
+    engine,
   };
 }

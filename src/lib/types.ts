@@ -43,6 +43,18 @@ export type RouteLeg = {
   distance_m: number;
   duration_s: number;
   note: string | null;
+  /**
+   * この区間だけの線形 [lng, lat][]。
+   * 地図は route.polyline ではなく leg 単位で描くので、
+   * 「徒歩は点線・鉄道は路線カラー」の描き分けがここで決まる。
+   */
+  polyline: [number, number][];
+  /** 鉄道区間のみ: 事業者名（運賃の按分キー） */
+  operator: string | null;
+  /** 鉄道区間のみ: 路線名 */
+  line: string | null;
+  /** 描画色。null ならモード既定色にフォールバック */
+  color: string | null;
 };
 
 export type TravelMode = "walk" | "transit" | "taxi" | "car";

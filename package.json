@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:index": "node scripts/build-poi-index.mjs",
+    "build:index": "node scripts/build-poi-index.mjs && node scripts/build-rail-graph.mjs",
+    "build:rail": "node scripts/build-rail-graph.mjs",
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start",
