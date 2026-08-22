@@ -15,6 +15,9 @@ import type { Itinerary, LatLng, Place, RouteLeg, RouteResult } from "@/lib/type
  *   route … get_route の結果。比較して捨てる使い捨て。プランの上に重なる
  * 両方あるときはプランを薄くして、いま聞いたことの答えが手前に来るようにする。
  *
+ * 地図に文字は載せない（ピンの番号と到着時刻だけ）。所要時間・距離・行程の説明は
+ * save_itinerary の返り値をもとにモデルが会話として書く。地図は線とピンだけを受け持つ。
+ *
  * タイル: OpenFreeMap（OpenMapTiles スキーマのベクタタイル / OSM 由来・APIキー不要・無料）
  * ラスタではなくベクタなので、ズームしてもラベルが潰れない。
  */
@@ -70,10 +73,6 @@ const PULSE_TAIL = 0.14;
 
 /** プランを薄くするときの倍率（get_route の結果が上に乗っているとき） */
 const PLAN_DIM = 0.4;
-/** これより短い区間には吹き出しを出さない（重なって読めなくなる） */
-const BUBBLE_MIN_M = 120;
-/** これより引いた画では吹き出しを畳む */
-const BUBBLE_MIN_ZOOM = 12;
 
 const EMPTY: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
 
@@ -142,19 +141,6 @@ function slice(chain: Chain, from: number, to: number): [number, number][] {
   return out.length >= 2 ? out : [];
 }
 
-/** chain 上で指定距離の位置にある座標 */
-function pointAt(chain: Chain, at: number): [number, number] {
-  const { pts, cum, total } = chain;
-  const d = Math.max(0, Math.min(at, total));
-  for (let i = 1; i < pts.length; i++) {
-    if (cum[i] >= d) {
-      const segLen = cum[i] - cum[i - 1] || 1;
-      return lerp(pts[i - 1], pts[i], (d - cum[i - 1]) / segLen);
-    }
-  }
-  return pts[pts.length - 1] ?? pts[0];
-}
-
 const easeOutCubic = (t: number) => 1 - (1 - t) ** 3;
 
 // ------------------------------------------------------------------ 表示の整形
@@ -162,12 +148,6 @@ const easeOutCubic = (t: number) => 1 - (1 - t) ** 3;
 const fmtDist = (m: number) => (m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`);
 const fmtMin = (s: number) => `${Math.max(1, Math.round(s / 60))}分`;
 const MODE_LABEL: Record<string, string> = { walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" };
-
-/** 区間の吹き出しに出す一行。鉄道は路線名があればそちらを使う。 */
-function legLabel(leg: RouteLeg): string {
-  const head = leg.mode === "transit" ? (leg.line ?? "電車") : MODE_LABEL[leg.mode] ?? leg.mode;
-  return `${head} ${fmtMin(leg.duration_s)}・${fmtDist(leg.distance_m)}`;
-}
 
 // ------------------------------------------------------------------ レイヤ定義
 
@@ -325,12 +305,9 @@ function nodeLayer(prefix: string): maplibregl.LayerSpecification {
 
 // ------------------------------------------------------------------ 描画
 
-type Painted = { parts: { chain: Chain; start: number }[]; total: number; wholeChain: Chain };
-
 /**
  * legs を地図に描く。始点から終点へ線を伸ばし、comet を指定されていれば
  * 描き終わったあと進行方向に光を流し続ける。
- * 戻り値は吹き出しの位置決めに使う chain 情報。
  */
 function paintRoute(
   map: MLMap,
@@ -338,11 +315,11 @@ function paintRoute(
   legs: RouteLeg[],
   animRef: { current: number | null },
   opts: { comet: boolean; animate: boolean },
-): Painted | null {
+): void {
   const src = map.getSource(prefix) as maplibregl.GeoJSONSource | undefined;
   const pulseSrc = map.getSource(`${prefix}-pulse`) as maplibregl.GeoJSONSource | undefined;
   const nodeSrc = map.getSource(`${prefix}-nodes`) as maplibregl.GeoJSONSource | undefined;
-  if (!src || !pulseSrc || !nodeSrc) return null;
+  if (!src || !pulseSrc || !nodeSrc) return;
 
   if (animRef.current !== null) cancelAnimationFrame(animRef.current);
   animRef.current = null;
@@ -352,7 +329,7 @@ function paintRoute(
     src.setData(EMPTY);
     pulseSrc.setData(EMPTY);
     nodeSrc.setData(EMPTY);
-    return null;
+    return;
   }
 
   // leg ごとに chain を作り、ルート全体での開始距離を持たせる
@@ -441,7 +418,7 @@ function paintRoute(
     src.setData(featuresUpTo(total));
     nodeSrc.setData({ type: "FeatureCollection", features: nodes });
     startPulse();
-    return { parts, total, wholeChain };
+    return;
   }
 
   // A: 始点から終点へ線を伸ばす。600〜800ms で1回だけ。
@@ -458,51 +435,6 @@ function paintRoute(
     startPulse(); // B: 描き終わったらコメットに引き継ぐ
   };
   animRef.current = requestAnimationFrame(draw);
-  return { parts, total, wholeChain };
-}
-
-/**
- * 区間の真ん中に吹き出しを置く。
- * 以前は地図の左上に固定チップで出していたが、複数区間だと「どの区間の話か」が分からない。
- * 線の上に置けば対応が自明になるし、地図の一等地も空く。
- */
-function makeBubbles(
-  map: MLMap,
-  painted: Painted,
-  legs: RouteLeg[],
-  variant: "plan" | "route",
-  summary: string | null,
-): maplibregl.Marker[] {
-  const usable = legs.filter((l) => (l.polyline?.length ?? 0) >= 2);
-  const out: maplibregl.Marker[] = [];
-
-  painted.parts.forEach((p, i) => {
-    const leg = usable[i];
-    if (!leg) return;
-    const isLast = i === painted.parts.length - 1;
-    // 短い区間の吹き出しは重なって読めなくなるので落とす。ただし総計は必ずどこかに出す。
-    if (p.chain.total < BUBBLE_MIN_M && !(isLast && summary)) return;
-
-    const el = document.createElement("div");
-    el.className = `route-bubble ${variant}`;
-    const main = document.createElement("div");
-    main.className = "rb-main";
-    main.textContent = legLabel(leg);
-    el.appendChild(main);
-    if (isLast && summary) {
-      const sub = document.createElement("div");
-      sub.className = "rb-sub";
-      sub.textContent = summary;
-      el.appendChild(sub);
-    }
-    out.push(
-      new maplibregl.Marker({ element: el, anchor: "center" })
-        .setLngLat(pointAt(p.chain, p.chain.total / 2))
-        .addTo(map),
-    );
-  });
-
-  return out;
 }
 
 type Entry = { marker: maplibregl.Marker; inner: HTMLElement; html: string; lngLat: [number, number] };
@@ -536,9 +468,6 @@ export default function MapPane({
   const meMarker = useRef<maplibregl.Marker | null>(null);
   const animRoute = useRef<number | null>(null);
   const animPlan = useRef<number | null>(null);
-  const bubbles = useRef<maplibregl.Marker[]>([]);
-  const paintedRoute = useRef<Painted | null>(null);
-  const paintedPlan = useRef<Painted | null>(null);
 
   // --- 初期化 ---------------------------------------------------------------
   useEffect(() => {
@@ -593,13 +522,6 @@ export default function MapPane({
     // 地図の余白をクリックしたら選択解除
     map.on("click", () => onSelect(null));
 
-    // 引いた画では吹き出しを畳む。HTML マーカーは自動で衝突回避してくれないので自前で。
-    const syncBubbleZoom = () => {
-      const hide = map.getZoom() < BUBBLE_MIN_ZOOM;
-      for (const b of bubbles.current) b.getElement().classList.toggle("rb-hidden", hide);
-    };
-    map.on("zoom", syncBubbleZoom);
-
     // ペイン高さ・サイドリストの出入りで幅が変わったら resize（roadmap §1.5-2）
     const ro = new ResizeObserver(() => map.resize());
     ro.observe(holder.current);
@@ -610,7 +532,6 @@ export default function MapPane({
       mapRef.current = null;
       ready.current = false;
       entries.current.clear();
-      bubbles.current = [];
     };
     // onSelect は page 側で useCallback 済み（ここで再初期化させない）
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -744,7 +665,7 @@ export default function MapPane({
     const map = mapRef.current;
     if (!map) return;
     const apply = () => {
-      paintedPlan.current = paintRoute(map, "plan", itinerary?.legs ?? [], animPlan, {
+      paintRoute(map, "plan", itinerary?.legs ?? [], animPlan, {
         comet: false,
         animate: true,
       });
@@ -762,7 +683,7 @@ export default function MapPane({
     const map = mapRef.current;
     if (!map) return;
     const apply = () => {
-      paintedRoute.current = paintRoute(map, "route", route?.legs ?? [], animRoute, {
+      paintRoute(map, "route", route?.legs ?? [], animRoute, {
         comet: true,
         animate: true,
       });
@@ -774,65 +695,6 @@ export default function MapPane({
       animRoute.current = null;
     };
   }, [route]);
-
-  // --- 経路の上の吹き出し ------------------------------------------------------
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const apply = () => {
-      for (const b of bubbles.current) b.remove();
-      bubbles.current = [];
-
-      // プラン側。総計には移動時間と累積標高を出す（滞在時間は含まない）。
-      if (itinerary && paintedPlan.current) {
-        const g = itinerary.total_elevation_gain_m;
-        bubbles.current.push(
-          ...makeBubbles(
-            map,
-            paintedPlan.current,
-            itinerary.legs,
-            "plan",
-            `合計 ${fmtDist(itinerary.total_distance_m)}・移動${fmtMin(itinerary.total_duration_s)}` +
-              (g !== null ? `・登り+${g}m` : ""),
-          ),
-        );
-      }
-
-      // get_route 側。旧来の左上チップに出していた内容がそのままここに来る。
-      if (route && paintedRoute.current) {
-        bubbles.current.push(
-          ...makeBubbles(
-            map,
-            paintedRoute.current,
-            route.legs,
-            "route",
-            `合計 ${fmtDist(route.distance_m)}・${fmtMin(route.duration_s)}` +
-              (route.estimated_fare_jpy !== null ? `・約${route.estimated_fare_jpy.toLocaleString()}円` : "") +
-              (route.elevation_gain_m !== null ? `・登り+${route.elevation_gain_m}m` : ""),
-          ),
-        );
-      }
-
-      const hide = map.getZoom() < BUBBLE_MIN_ZOOM;
-      for (const b of bubbles.current) b.getElement().classList.toggle("rb-hidden", hide);
-    };
-
-    // paintRoute の描き出しアニメーションが終わってから出す（線より先に字が浮くと落ち着かない）。
-    // 初回はスタイルのロード待ちで paintRoute 自体が遅れるので、load を待ってから計り始める。
-    let t: ReturnType<typeof setTimeout> | null = null;
-    const schedule = () => {
-      t = setTimeout(apply, DRAW_MS + 40);
-    };
-    if (ready.current) schedule();
-    else map.once("load", schedule);
-
-    return () => {
-      if (t) clearTimeout(t);
-      for (const b of bubbles.current) b.remove();
-      bubbles.current = [];
-    };
-  }, [route, itinerary]);
 
   // --- プランを薄くする（get_route の結果が上に乗っているとき） -------------------
   useEffect(() => {

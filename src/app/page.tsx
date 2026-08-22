@@ -240,8 +240,8 @@ export default function Page() {
         />
 
         {/*
-          ルートの要約は地図の左上ではなく経路の上に出す（MapPane の makeBubbles）。
-          複数区間あるとき「どの区間の話か」が固定チップでは分からないため。
+          地図には線とピンだけを描き、文字は載せない。
+          所要時間・到着時刻は save_itinerary の返り値をもとにモデルが会話として書く。
         */}
 
         {places.length > 0 &&

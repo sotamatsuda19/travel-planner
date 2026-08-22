@@ -209,7 +209,14 @@ function summarize(tu: Anthropic.ToolUseBlock): string {
     };
     return `${label[String(input.mode)] ?? String(input.mode)}ルートを計算中…`;
   }
-  if (tu.name === "save_itinerary") return `旅のしおり「${input.title}」を保存中…`;
+  if (tu.name === "save_itinerary") {
+    // 保存ではなく、区間ごとの経路と所要時間を実際に計算している。
+    // キャッシュに無い区間だけ OSRM と国土地理院を叩くので、待ち時間はプランの中身次第。
+    const stops = Array.isArray(input.days)
+      ? (input.days as { items?: unknown[] }[]).reduce((n, d) => n + (d.items?.length ?? 0), 0)
+      : 0;
+    return `プラン「${input.title}」の経路と到着時刻を計算中${stops ? `（${stops}か所）` : ""}…`;
+  }
   return `${tu.name} を実行中…`;
 }
 

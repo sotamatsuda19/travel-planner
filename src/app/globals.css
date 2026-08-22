@@ -443,65 +443,6 @@ body {
   color: #52616e;
 }
 
-/*
- * 経路の上に置く吹き出し。
- * 以前は地図左上に固定チップを置いて距離・時間・料金を出していたが、
- * 区間が複数あると「どの区間の話か」が分からないので、線の真ん中に移した。
- *
- * HTML マーカーなので衝突回避が効かない。短い区間は出さない・引いた画では畳む、
- * という間引きを MapPane 側でやっている（BUBBLE_MIN_M / BUBBLE_MIN_ZOOM）。
- */
-.route-bubble {
-  position: relative;
-  padding: 3px 8px;
-  border-radius: 7px;
-  font-size: 11px;
-  line-height: 1.35;
-  white-space: nowrap;
-  text-align: center;
-  background: rgba(16, 22, 29, 0.9);
-  border: 1px solid var(--line);
-  color: var(--text);
-  backdrop-filter: blur(6px);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
-  /* 地図のドラッグとクリック（＝選択解除）を邪魔しない */
-  pointer-events: none;
-  transition: opacity 140ms ease;
-}
-/* 吹き出しの尻尾。線に向かって下向きに出す。 */
-.route-bubble::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: -5px;
-  width: 8px;
-  height: 8px;
-  transform: translateX(-50%) rotate(45deg);
-  background: rgba(16, 22, 29, 0.9);
-  border-right: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-}
-.route-bubble.route {
-  border-color: var(--accent);
-}
-.route-bubble.route::after {
-  border-color: var(--accent);
-}
-.route-bubble.plan {
-  border-color: var(--itin-pin);
-}
-.route-bubble.plan::after {
-  border-color: var(--itin-pin);
-}
-.route-bubble .rb-sub {
-  margin-top: 1px;
-  font-size: 10px;
-  color: var(--muted);
-}
-.route-bubble.rb-hidden {
-  opacity: 0;
-}
-
 /* ピンの真上に載る到着予定時刻 */
 .pin-time {
   margin: 0 auto 2px;
