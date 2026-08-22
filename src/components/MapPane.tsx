@@ -2,6 +2,7 @@
 
 import maplibregl, { type LngLatBoundsLike, type Map as MLMap } from "maplibre-gl";
 import { useEffect, useRef } from "react";
+import Attribution from "./Attribution";
 import type { Itinerary, LatLng, Place, RouteLeg, RouteResult } from "@/lib/types";
 
 /**
@@ -762,17 +763,7 @@ export default function MapPane({
   return (
     <>
       <div ref={holder} className="map" />
-      <div className="map-attr">
-        地図: <a href="https://openfreemap.org" target="_blank" rel="noreferrer">OpenFreeMap</a>
-        {" © "}
-        <a href="https://openmaptiles.org/" target="_blank" rel="noreferrer">OpenMapTiles</a>
-        {" / "}
-        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a>
-        {" / "}スポット:{" "}
-        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OSM</a>,{" "}
-        <a href="https://www.wikidata.org/" target="_blank" rel="noreferrer">Wikidata</a>,{" "}
-        <a href="https://ja.wikivoyage.org/" target="_blank" rel="noreferrer">Wikivoyage</a>
-      </div>
+      <Attribution />
     </>
   );
 }
