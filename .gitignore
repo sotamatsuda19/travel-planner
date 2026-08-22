@@ -4,9 +4,4 @@ node_modules/
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store
-README.md
-
-# 非圧縮の中間生成物。リポジトリに載せるのは data/poi.jsonl.gz の方（24MB → 約3MB）。
-# build:index の入力は親ディレクトリの 4.8GB なので、デプロイ先では再生成できない。
-# よって areas.json / stations.json / poi.jsonl.gz はコミットする。
 data/poi.jsonl
