@@ -86,37 +86,6 @@ body {
   inset: 0;
 }
 
-.map-overlay {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 5;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-  max-width: calc(100% - 20px);
-}
-
-.chip {
-  background: rgba(16, 22, 29, 0.86);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 5px 11px;
-  font-size: 12px;
-  color: var(--text);
-  backdrop-filter: blur(6px);
-  white-space: nowrap;
-}
-.chip.accent {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.chip.warn {
-  border-color: var(--accent-2);
-  color: var(--accent-2);
-}
-
 /* 帰属表示は必須なので、浮動パネルより前面に置いて隠れないようにする */
 .map-attr {
   position: absolute;
@@ -474,31 +443,78 @@ body {
   color: #52616e;
 }
 
-.itin-strip {
-  flex: 0 0 auto;
-  display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  padding: 8px 14px;
-  border-top: 1px solid var(--line);
-  background: #131b23;
-}
-.itin-card {
-  flex: 0 0 auto;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 12px;
-  min-width: 120px;
-}
-.itin-card .n {
-  color: var(--accent-2);
-  font-weight: 700;
-  margin-right: 5px;
-}
-.itin-card .t {
-  color: var(--muted);
+/*
+ * 経路の上に置く吹き出し。
+ * 以前は地図左上に固定チップを置いて距離・時間・料金を出していたが、
+ * 区間が複数あると「どの区間の話か」が分からないので、線の真ん中に移した。
+ *
+ * HTML マーカーなので衝突回避が効かない。短い区間は出さない・引いた画では畳む、
+ * という間引きを MapPane 側でやっている（BUBBLE_MIN_M / BUBBLE_MIN_ZOOM）。
+ */
+.route-bubble {
+  position: relative;
+  padding: 3px 8px;
+  border-radius: 7px;
   font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
+  text-align: center;
+  background: rgba(16, 22, 29, 0.9);
+  border: 1px solid var(--line);
+  color: var(--text);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  /* 地図のドラッグとクリック（＝選択解除）を邪魔しない */
+  pointer-events: none;
+  transition: opacity 140ms ease;
+}
+/* 吹き出しの尻尾。線に向かって下向きに出す。 */
+.route-bubble::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 8px;
+  height: 8px;
+  transform: translateX(-50%) rotate(45deg);
+  background: rgba(16, 22, 29, 0.9);
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.route-bubble.route {
+  border-color: var(--accent);
+}
+.route-bubble.route::after {
+  border-color: var(--accent);
+}
+.route-bubble.plan {
+  border-color: var(--itin-pin);
+}
+.route-bubble.plan::after {
+  border-color: var(--itin-pin);
+}
+.route-bubble .rb-sub {
+  margin-top: 1px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.route-bubble.rb-hidden {
+  opacity: 0;
+}
+
+/* ピンの真上に載る到着予定時刻 */
+.pin-time {
+  margin: 0 auto 2px;
+  width: fit-content;
+  padding: 1px 5px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  white-space: nowrap;
+  color: #20262e;
+  background: var(--itin-pin);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
 }
 
 /* 画面が狭いときはパネルを詰めて、地図の見える面積を確保する */

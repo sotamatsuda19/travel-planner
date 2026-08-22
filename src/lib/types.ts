@@ -131,10 +131,21 @@ export type ItineraryItem = {
   name: string;
   lat: number;
   lng: number;
+  /** LLM が指定した時刻。指定が無ければ null（arrive_time は積み上げで入る） */
   start_time: string | null;
   duration_min: number | null;
   note: string | null;
-  travel_from_previous: { mode: TravelMode; duration_s: number } | null;
+  /** 到着予定 "HH:MM"。前の場所からの移動時間を積み上げた結果 */
+  arrive_time: string | null;
+  /** 出発予定 "HH:MM"。滞在時間が分かっているときだけ入る */
+  depart_time: string | null;
+  travel_from_previous: {
+    mode: TravelMode;
+    duration_s: number;
+    distance_m: number;
+    /** 徒歩区間のみ。国土地理院の標高から出した登り累計 */
+    elevation_gain_m: number | null;
+  } | null;
 };
 
 export type ItineraryDay = {
@@ -145,6 +156,17 @@ export type ItineraryDay = {
 export type Itinerary = {
   title: string;
   days: ItineraryDay[];
+  /**
+   * 全区間を繋いだ経路。地図はこれを**常設レイヤ**として描く。
+   * get_route の結果（探索用・使い捨て）とは別レイヤで共存させる。
+   * 形は RouteResult.legs と同じなので、既存の描き分け（徒歩は点線・鉄道は路線カラー）が
+   * そのまま使える。
+   */
+  legs: RouteLeg[];
+  total_distance_m: number;
+  /** 移動時間の合計（滞在時間は含まない） */
+  total_duration_s: number;
+  total_elevation_gain_m: number | null;
 };
 
 /** SSE で流すイベント */

@@ -190,6 +190,8 @@ export default function Page() {
                 break;
               case "itinerary":
                 setItinerary(ev.itinerary);
+                // プランは get_route の結果を含んだ上位互換なので、探索用の線は畳む
+                setRoute(null);
                 break;
               case "context":
                 // 天気・現在地はモデル側の文脈にだけ効かせる（画面には出さない）
@@ -223,8 +225,6 @@ export default function Page() {
     setSelectedId(null);
   };
 
-  const itinItems = itinerary?.days.flatMap((d) => d.items) ?? [];
-
   return (
     <div className="shell" ref={shellRef}>
       {/* ───── 上：地図（全面）＋ 上に浮く候補パネル ───── */}
@@ -239,16 +239,10 @@ export default function Page() {
           padRight={panelShown ? padRight : 40}
         />
 
-        {/* 残すのはルート要約だけ。天気・現在地・件数・累積標高は会話側に任せる。 */}
-        {route && (
-          <div className="map-overlay">
-            <span className="chip accent">
-              {{ walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" }[route.mode]}{" "}
-              {(route.distance_m / 1000).toFixed(1)}km / 約{Math.round(route.duration_s / 60)}分
-              {route.estimated_fare_jpy !== null && ` / 約${route.estimated_fare_jpy.toLocaleString()}円`}
-            </span>
-          </div>
-        )}
+        {/*
+          ルートの要約は地図の左上ではなく経路の上に出す（MapPane の makeBubbles）。
+          複数区間あるとき「どの区間の話か」が固定チップでは分からないため。
+        */}
 
         {places.length > 0 &&
           (listOpen ? (
@@ -337,24 +331,6 @@ export default function Page() {
           ))}
           {busy && <div className="bubble tool dots">考え中</div>}
         </div>
-
-        {itinItems.length > 0 && (
-          <div className="itin-strip">
-            {itinItems.map((it, i) => (
-              <div className="itin-card" key={`${it.place_id}-${i}`}>
-                <div>
-                  <span className="n">{i + 1}</span>
-                  {it.name}
-                </div>
-                <div className="t">
-                  {[it.start_time, it.duration_min ? `${it.duration_min}分` : null, it.note]
-                    .filter(Boolean)
-                    .join(" / ")}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
 
         {messages.length === 0 && (
           <div className="suggestions">

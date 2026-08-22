@@ -130,7 +130,7 @@ function splitAtWaypoints(polyline: [number, number][], stops: Stop[]): [number,
 // ------------------------------------------------------------- 標高（国土地理院）
 
 /** polyline を等間隔にサンプリングして累積標高を出す（国土地理院 標高API / 政府オープンデータ） */
-async function elevationGain(polyline: [number, number][]): Promise<number | null> {
+export async function elevationGain(polyline: [number, number][]): Promise<number | null> {
   if (process.env.DISABLE_ELEVATION === "1") return null;
   if (polyline.length < 2) return null;
   const samples = 10;

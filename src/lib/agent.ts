@@ -9,6 +9,8 @@ import {
   toPlace,
 } from "./poi";
 import { buildRoute } from "./route";
+import { buildPlan } from "./plan";
+import { harvestRoute } from "./legcache";
 import type { AccessRequirement } from "./poi";
 import type { Accessibility, Itinerary, LatLng, Place, RouteResult, TravelMode } from "./types";
 
@@ -95,9 +97,11 @@ export const TOOLS: Anthropic.Tool[] = [
   {
     name: "save_itinerary",
     description:
-      "旅程（旅のしおり）を保存する。差分ではなく毎回**旅程全体を丸ごと**渡すこと。" +
+      "プラン（旅程）を地図に表示する。差分ではなく毎回**旅程全体を丸ごと**渡すこと。" +
       "並べ替え・削除・時刻変更もすべてこのツールを全置換で呼び直して表現する。" +
-      "保存した場所は地図上で番号つきの濃いピンとして強調表示される。",
+      "呼ぶと地図に、番号つきのピン・地点間をつないだ連続した経路・区間ごとの所要時間・" +
+      "到着予定時刻がまとめて描画される。所要時間と到着時刻はバックエンドが実際に経路を" +
+      "計算して出すので、こちらで見積もらなくてよい。",
     strict: true,
     input_schema: {
       type: "object",
@@ -148,16 +152,22 @@ export const SYSTEM_PROMPT = `あなたは東京の旅行・おでかけプラ�
 
 ## 基本動作
 - 場所を探すときは必ず search_places を呼ぶ。記憶から店名や座標を書かない。存在しない店を作らない。
-- 検索結果・経路は**自動的に地図に反映される**。だから文章で全件を列挙し直さない。
+- 検索結果・経路・プランは**自動的に地図に反映される**。だから文章で全件を列挙し直さない。
   「地図に5軒出しました」と伝えたうえで、おすすめ2〜3件の“選ぶ理由”だけを書く。
+  プランを表示したあとも同じ。時刻や所要時間を1件ずつ書き出さず、
+  全体の印象（「移動は合計40分、坂はほぼ無し」）と気をつける点だけを言う。
 - 返答は短く。3〜5文が基本。箇条書きは3項目まで。
-- ユーザーが決めきれていない段階でしおりを保存しない。「これにする」と決まってから save_itinerary。
+- プランが固まってきたら、回答の最後に「このプランを地図に詳細表示しますか？」と**一度だけ**聞く。
+  了承されたら save_itinerary を呼ぶ。決めきれていない段階では呼ばない。
+- 一度表示したあとの変更（順番の入れ替え・追加・削除・時刻変更）では**聞き直さない**。
+  そのまま save_itinerary を全置換で呼び直して地図を更新する。
 
 ## ツールの使い分け
 - search_places … 場所を探す。カテゴリが複数あるなら並列に複数回呼ぶ。
   車椅子・ベビーカー・食事制限などの条件が出たら require で絞る。
 - get_route … 経路・所要時間・タクシー料金・坂道のきつさ（累積標高）を出す。移動手段の比較は mode を変えて複数回。
-- save_itinerary … 旅程の保存。**常に全体を丸ごと**渡す（差分更新はしない）。
+- save_itinerary … プランを地図に敷く。**常に全体を丸ごと**渡す（差分更新はしない）。
+  経路・所要時間・到着予定時刻は地図に出るので、返ってきた一覧を文章で並べ直さない。
 
 ## やらないこと
 - 地図のズームやカメラ操作を指示しない。検索結果・ルートの範囲に自動で合う。
@@ -221,6 +231,8 @@ export async function tokyoWeather(): Promise<string | null> {
 }
 
 export type TurnContext = {
+  /** 区間キャッシュ（legcache）の引き当て単位。会話が変われば別のキャッシュになる。 */
+  sessionId: string;
   location: LatLng;
   now: Date;
   weather: string | null;
@@ -388,6 +400,8 @@ export async function runTool(
     }
 
     const route = await buildRoute(stops, mode);
+    // ここで計算した区間は、あとでプランに現れたときに使い回す（legcache.ts）
+    harvestRoute(ctx.sessionId, ids, route, ctx.location);
     const modeLabel = { walk: "徒歩", transit: "電車中心", taxi: "タクシー", car: "車" }[mode];
     const legText = route.legs
       .map(
@@ -439,22 +453,16 @@ export async function runTool(
         }
         return [
           {
-            place_id: it.place_id,
-            name: rec.name,
-            lat: rec.lat,
-            lng: rec.lon,
+            stop: { place_id: it.place_id, name: rec.name, lat: rec.lat, lng: rec.lon },
             start_time: it.start_time ?? null,
             duration_min: it.duration_min ?? null,
             note: it.note ?? null,
-            travel_from_previous: it.travel_mode_from_previous
-              ? { mode: it.travel_mode_from_previous, duration_s: 0 }
-              : null,
+            mode_from_previous: it.travel_mode_from_previous ?? null,
           },
         ];
       }),
     }));
 
-    const itinerary: Itinerary = { title, days };
     const total = days.reduce((n, d) => n + d.items.length, 0);
     if (total === 0) {
       return {
@@ -462,10 +470,50 @@ export async function runTool(
       };
     }
 
+    // 区間の経路・所要時間・到着予定時刻をここで埋める。
+    // 全置換で毎回全区間が来るが、実際に計算するのはキャッシュに無いものだけ。
+    const itinerary: Itinerary = await buildPlan({
+      sessionId: ctx.sessionId,
+      title,
+      days,
+      at: ctx.location,
+      now: ctx.now,
+    });
+
+    const timeline = itinerary.days
+      .flatMap((d, di) =>
+        d.items.map((it) => {
+          const move = it.travel_from_previous;
+          const moveText = move
+            ? `（前から ${{ walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" }[move.mode]}` +
+              `${Math.round(move.duration_s / 60)}分` +
+              `${move.elevation_gain_m ? `・登り+${move.elevation_gain_m}m` : ""}）`
+            : "";
+          return [
+            itinerary.days.length > 1 ? `${di + 1}日目 ` : "",
+            it.arrive_time ? `${it.arrive_time} ` : "",
+            it.name,
+            it.duration_min ? ` 滞在${it.duration_min}分` : "",
+            moveText,
+            it.note ? ` / ${it.note}` : "",
+          ].join("");
+        }),
+      )
+      .join("\n");
+
     return {
-      content:
-        `旅程「${title}」を保存しました（${days.length}日 / 全${total}件）。地図では番号つきの濃いピンで強調表示されています。` +
-        (missing.length ? `\n※ 次の place_id は見つからず除外しました: ${missing.join(", ")}` : ""),
+      content: [
+        `プラン「${title}」を地図に表示しました（${itinerary.days.length}日 / 全${total}件）。`,
+        "経路・番号つきピン・到着予定時刻が地図上に出ています。**この一覧を文章で繰り返さないこと。**",
+        `移動の合計: ${(itinerary.total_distance_m / 1000).toFixed(1)}km / 約${Math.round(itinerary.total_duration_s / 60)}分` +
+          (itinerary.total_elevation_gain_m !== null
+            ? ` / 累積標高 +${itinerary.total_elevation_gain_m}m${itinerary.total_elevation_gain_m > 60 ? "（坂が多め）" : "（ほぼ平坦）"}`
+            : ""),
+        timeline,
+        missing.length ? `※ 次の place_id は見つからず除外しました: ${missing.join(", ")}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
       itinerary,
     };
   }

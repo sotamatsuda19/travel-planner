@@ -2,13 +2,18 @@
 
 import maplibregl, { type LngLatBoundsLike, type Map as MLMap } from "maplibre-gl";
 import { useEffect, useRef } from "react";
-import type { Itinerary, LatLng, Place, RouteResult } from "@/lib/types";
+import type { Itinerary, LatLng, Place, RouteLeg, RouteResult } from "@/lib/types";
 
 /**
  * 上ペインの地図。
  *
  * 地図は「共有状態の投影」でしかない（roadmap §1）。LLM は地図を操作せず、
  * search_places / get_route / save_itinerary の結果がそのままここに流れてくる。
+ *
+ * 線は2系統ある。
+ *   plan  … save_itinerary で確定したプラン。常設。番号ピン・到着時刻とセット
+ *   route … get_route の結果。比較して捨てる使い捨て。プランの上に重なる
+ * 両方あるときはプランを薄くして、いま聞いたことの答えが手前に来るようにする。
  *
  * タイル: OpenFreeMap（OpenMapTiles スキーマのベクタタイル / OSM 由来・APIキー不要・無料）
  * ラスタではなくベクタなので、ズームしてもラベルが潰れない。
@@ -62,6 +67,13 @@ const DRAW_MS = 750;
 /** コメット（進行方向のパルス）の周期（ms）と尾の長さ（全長比） */
 const PULSE_MS = 3000;
 const PULSE_TAIL = 0.14;
+
+/** プランを薄くするときの倍率（get_route の結果が上に乗っているとき） */
+const PLAN_DIM = 0.4;
+/** これより短い区間には吹き出しを出さない（重なって読めなくなる） */
+const BUBBLE_MIN_M = 120;
+/** これより引いた画では吹き出しを畳む */
+const BUBBLE_MIN_ZOOM = 12;
 
 const EMPTY: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
 
@@ -130,7 +142,368 @@ function slice(chain: Chain, from: number, to: number): [number, number][] {
   return out.length >= 2 ? out : [];
 }
 
+/** chain 上で指定距離の位置にある座標 */
+function pointAt(chain: Chain, at: number): [number, number] {
+  const { pts, cum, total } = chain;
+  const d = Math.max(0, Math.min(at, total));
+  for (let i = 1; i < pts.length; i++) {
+    if (cum[i] >= d) {
+      const segLen = cum[i] - cum[i - 1] || 1;
+      return lerp(pts[i - 1], pts[i], (d - cum[i - 1]) / segLen);
+    }
+  }
+  return pts[pts.length - 1] ?? pts[0];
+}
+
 const easeOutCubic = (t: number) => 1 - (1 - t) ** 3;
+
+// ------------------------------------------------------------------ 表示の整形
+
+const fmtDist = (m: number) => (m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`);
+const fmtMin = (s: number) => `${Math.max(1, Math.round(s / 60))}分`;
+const MODE_LABEL: Record<string, string> = { walk: "徒歩", transit: "電車", taxi: "タクシー", car: "車" };
+
+/** 区間の吹き出しに出す一行。鉄道は路線名があればそちらを使う。 */
+function legLabel(leg: RouteLeg): string {
+  const head = leg.mode === "transit" ? (leg.line ?? "電車") : MODE_LABEL[leg.mode] ?? leg.mode;
+  return `${head} ${fmtMin(leg.duration_s)}・${fmtDist(leg.distance_m)}`;
+}
+
+// ------------------------------------------------------------------ レイヤ定義
+
+/**
+ * 1本の経路を描くためのレイヤ一式。
+ * plan（確定したプラン）と route（get_route の使い捨て）で同じ見た目を使い、
+ * 濃さだけ変えて重ねるので、定義を1か所にまとめてある。
+ */
+function routeLayers(prefix: string): maplibregl.LayerSpecification[] {
+  const source = prefix;
+  const color: maplibregl.ExpressionSpecification = ["coalesce", ["get", "color"], MODE_COLOR.walk];
+  const isWalk: maplibregl.FilterSpecification = ["==", ["get", "walk"], true];
+  const notWalk: maplibregl.FilterSpecification = ["!=", ["get", "walk"], true];
+
+  return [
+    // 発光。ダークな UI 上でもルートが浮き上がる。
+    {
+      id: `${prefix}-glow`,
+      type: "line",
+      source,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": color,
+        "line-width": lineWidth(2.4),
+        "line-blur": 8,
+        "line-opacity": 0.35,
+      },
+    },
+    // 徒歩以外の実線区間：白い縁取り + 本体
+    {
+      id: `${prefix}-casing`,
+      type: "line",
+      source,
+      filter: notWalk,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": "#ffffff", "line-width": lineWidth(1, 5), "line-opacity": 0.92 },
+    },
+    {
+      id: `${prefix}-line`,
+      type: "line",
+      source,
+      filter: notWalk,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": color, "line-width": lineWidth(), "line-opacity": 1 },
+    },
+    // 徒歩区間：丸ドットの点線
+    {
+      id: `${prefix}-walk-halo`,
+      type: "line",
+      source,
+      filter: isWalk,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#ffffff",
+        "line-width": WALK_HALO_W,
+        "line-dasharray": WALK_HALO_DASH,
+        "line-opacity": 0.9,
+      },
+    },
+    {
+      id: `${prefix}-walk`,
+      type: "line",
+      source,
+      filter: isWalk,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": color,
+        "line-width": WALK_W,
+        "line-dasharray": WALK_DASH,
+        "line-opacity": 1,
+      },
+    },
+  ];
+}
+
+/** 各レイヤの素の不透明度。薄くするときはこれに倍率を掛ける。 */
+const BASE_OPACITY: Record<string, number> = {
+  glow: 0.35,
+  casing: 0.92,
+  line: 1,
+  "walk-halo": 0.9,
+  walk: 1,
+};
+
+/**
+ * 進行方向に流れる光。尾に向かって透明にする（line-gradient は lineMetrics 必須）。
+ * 薄いハローと細い芯の2枚重ね。1枚だと路線カラーに埋もれて見えない。
+ */
+function pulseLayers(prefix: string): maplibregl.LayerSpecification[] {
+  const source = `${prefix}-pulse`;
+  return [
+    {
+      id: `${prefix}-pulse-halo`,
+      type: "line",
+      source,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-width": lineWidth(2.1),
+        "line-blur": 5,
+        "line-gradient": [
+          "interpolate",
+          ["linear"],
+          ["line-progress"],
+          0,
+          "rgba(255,255,255,0)",
+          0.6,
+          "rgba(255,255,255,0.25)",
+          1,
+          "rgba(255,255,255,0.85)",
+        ],
+      },
+    },
+    {
+      id: `${prefix}-pulse`,
+      type: "line",
+      source,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-width": lineWidth(0.62),
+        "line-blur": 0.6,
+        "line-gradient": [
+          "interpolate",
+          ["linear"],
+          ["line-progress"],
+          0,
+          "rgba(255,255,255,0)",
+          0.7,
+          "rgba(255,255,255,0.55)",
+          0.92,
+          "rgba(255,255,255,1)",
+          1,
+          "rgba(255,255,255,1)",
+        ],
+      },
+    },
+  ];
+}
+
+/** 乗換駅・起終点 */
+function nodeLayer(prefix: string): maplibregl.LayerSpecification {
+  return {
+    id: `${prefix}-nodes`,
+    type: "circle",
+    source: `${prefix}-nodes`,
+    paint: {
+      "circle-radius": ["case", ["==", ["get", "kind"], "end"], 6.5, 5],
+      "circle-color": "#ffffff",
+      "circle-stroke-width": 2.6,
+      "circle-stroke-color": ["coalesce", ["get", "color"], "#5f6b7a"],
+      "circle-opacity": 1,
+      "circle-stroke-opacity": 1,
+    },
+  };
+}
+
+// ------------------------------------------------------------------ 描画
+
+type Painted = { parts: { chain: Chain; start: number }[]; total: number; wholeChain: Chain };
+
+/**
+ * legs を地図に描く。始点から終点へ線を伸ばし、comet を指定されていれば
+ * 描き終わったあと進行方向に光を流し続ける。
+ * 戻り値は吹き出しの位置決めに使う chain 情報。
+ */
+function paintRoute(
+  map: MLMap,
+  prefix: string,
+  legs: RouteLeg[],
+  animRef: { current: number | null },
+  opts: { comet: boolean; animate: boolean },
+): Painted | null {
+  const src = map.getSource(prefix) as maplibregl.GeoJSONSource | undefined;
+  const pulseSrc = map.getSource(`${prefix}-pulse`) as maplibregl.GeoJSONSource | undefined;
+  const nodeSrc = map.getSource(`${prefix}-nodes`) as maplibregl.GeoJSONSource | undefined;
+  if (!src || !pulseSrc || !nodeSrc) return null;
+
+  if (animRef.current !== null) cancelAnimationFrame(animRef.current);
+  animRef.current = null;
+
+  const usable = legs.filter((l) => (l.polyline?.length ?? 0) >= 2);
+  if (usable.length === 0) {
+    src.setData(EMPTY);
+    pulseSrc.setData(EMPTY);
+    nodeSrc.setData(EMPTY);
+    return null;
+  }
+
+  // leg ごとに chain を作り、ルート全体での開始距離を持たせる
+  let offset = 0;
+  const parts = usable.map((l) => {
+    const chain = chainOf(l.polyline as [number, number][]);
+    const start = offset;
+    offset += chain.total;
+    return {
+      chain,
+      start,
+      walk: l.mode === "walk",
+      color: l.color ?? MODE_COLOR[l.mode] ?? MODE_COLOR.walk,
+      mode: l.mode,
+      label: l.line ?? null,
+    };
+  });
+  const total = offset;
+
+  // 全体を繋いだ1本（コメットが leg 境界で途切れないように）
+  const whole: [number, number][] = [];
+  for (const p of parts) {
+    if (whole.length === 0) whole.push(...p.chain.pts);
+    else whole.push(...p.chain.pts.slice(1));
+  }
+  const wholeChain = chainOf(whole);
+
+  const featuresUpTo = (d: number): GeoJSON.FeatureCollection => ({
+    type: "FeatureCollection",
+    features: parts.flatMap((p) => {
+      const cut = Math.min(p.chain.total, d - p.start);
+      if (cut <= 0) return [];
+      const coords = cut >= p.chain.total ? p.chain.pts : slice(p.chain, 0, cut);
+      if (coords.length < 2) return [];
+      return [
+        {
+          type: "Feature" as const,
+          properties: { color: p.color, walk: p.walk, mode: p.mode, line: p.label },
+          geometry: { type: "LineString" as const, coordinates: coords },
+        },
+      ];
+    }),
+  });
+
+  const nodes: GeoJSON.Feature[] = [];
+  const pushNode = (at: [number, number], kind: string, color: string, name: string) => {
+    nodes.push({ type: "Feature", properties: { kind, color, name }, geometry: { type: "Point", coordinates: at } });
+  };
+  pushNode(parts[0].chain.pts[0], "end", "#5f6b7a", "");
+  const last = parts[parts.length - 1].chain;
+  pushNode(last.pts[last.pts.length - 1], "end", "#5f6b7a", "");
+  for (let i = 1; i < parts.length; i++) {
+    if (parts[i - 1].mode !== "transit" && parts[i].mode !== "transit") continue;
+    const c = parts[i].mode === "transit" ? parts[i].color : parts[i - 1].color;
+    pushNode(parts[i].chain.pts[0], "transfer", c, usable[i].from);
+  }
+
+  const startPulse = () => {
+    if (!opts.comet) {
+      pulseSrc.setData(EMPTY);
+      return;
+    }
+    const tail = Math.max(120, total * PULSE_TAIL);
+    const t0 = performance.now();
+    const frame = (now: number) => {
+      const phase = ((now - t0) % PULSE_MS) / PULSE_MS;
+      const head = phase * (total + tail);
+      const coords = slice(wholeChain, head - tail, head);
+      pulseSrc.setData(
+        coords.length >= 2
+          ? {
+              type: "FeatureCollection",
+              features: [
+                { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: coords } },
+              ],
+            }
+          : EMPTY,
+      );
+      animRef.current = requestAnimationFrame(frame);
+    };
+    animRef.current = requestAnimationFrame(frame);
+  };
+
+  pulseSrc.setData(EMPTY);
+  if (!opts.animate) {
+    src.setData(featuresUpTo(total));
+    nodeSrc.setData({ type: "FeatureCollection", features: nodes });
+    startPulse();
+    return { parts, total, wholeChain };
+  }
+
+  // A: 始点から終点へ線を伸ばす。600〜800ms で1回だけ。
+  nodeSrc.setData(EMPTY);
+  const t0 = performance.now();
+  const draw = (now: number) => {
+    const t = Math.min(1, (now - t0) / DRAW_MS);
+    src.setData(featuresUpTo(easeOutCubic(t) * total));
+    if (t < 1) {
+      animRef.current = requestAnimationFrame(draw);
+      return;
+    }
+    nodeSrc.setData({ type: "FeatureCollection", features: nodes });
+    startPulse(); // B: 描き終わったらコメットに引き継ぐ
+  };
+  animRef.current = requestAnimationFrame(draw);
+  return { parts, total, wholeChain };
+}
+
+/**
+ * 区間の真ん中に吹き出しを置く。
+ * 以前は地図の左上に固定チップで出していたが、複数区間だと「どの区間の話か」が分からない。
+ * 線の上に置けば対応が自明になるし、地図の一等地も空く。
+ */
+function makeBubbles(
+  map: MLMap,
+  painted: Painted,
+  legs: RouteLeg[],
+  variant: "plan" | "route",
+  summary: string | null,
+): maplibregl.Marker[] {
+  const usable = legs.filter((l) => (l.polyline?.length ?? 0) >= 2);
+  const out: maplibregl.Marker[] = [];
+
+  painted.parts.forEach((p, i) => {
+    const leg = usable[i];
+    if (!leg) return;
+    const isLast = i === painted.parts.length - 1;
+    // 短い区間の吹き出しは重なって読めなくなるので落とす。ただし総計は必ずどこかに出す。
+    if (p.chain.total < BUBBLE_MIN_M && !(isLast && summary)) return;
+
+    const el = document.createElement("div");
+    el.className = `route-bubble ${variant}`;
+    const main = document.createElement("div");
+    main.className = "rb-main";
+    main.textContent = legLabel(leg);
+    el.appendChild(main);
+    if (isLast && summary) {
+      const sub = document.createElement("div");
+      sub.className = "rb-sub";
+      sub.textContent = summary;
+      el.appendChild(sub);
+    }
+    out.push(
+      new maplibregl.Marker({ element: el, anchor: "center" })
+        .setLngLat(pointAt(p.chain, p.chain.total / 2))
+        .addTo(map),
+    );
+  });
+
+  return out;
+}
 
 type Entry = { marker: maplibregl.Marker; inner: HTMLElement; html: string; lngLat: [number, number] };
 
@@ -161,7 +534,11 @@ export default function MapPane({
   const entries = useRef<Map<string, Entry>>(new Map());
   const popup = useRef<maplibregl.Popup | null>(null);
   const meMarker = useRef<maplibregl.Marker | null>(null);
-  const anim = useRef<number | null>(null);
+  const animRoute = useRef<number | null>(null);
+  const animPlan = useRef<number | null>(null);
+  const bubbles = useRef<maplibregl.Marker[]>([]);
+  const paintedRoute = useRef<Painted | null>(null);
+  const paintedPlan = useRef<Painted | null>(null);
 
   // --- 初期化 ---------------------------------------------------------------
   useEffect(() => {
@@ -181,9 +558,11 @@ export default function MapPane({
     popup.current = new maplibregl.Popup({ offset: 30, closeButton: false, closeOnClick: false });
 
     map.on("load", () => {
-      map.addSource("route", { type: "geojson", data: EMPTY });
-      map.addSource("route-pulse", { type: "geojson", data: EMPTY, lineMetrics: true });
-      map.addSource("route-nodes", { type: "geojson", data: EMPTY });
+      for (const prefix of ["plan", "route"]) {
+        map.addSource(prefix, { type: "geojson", data: EMPTY });
+        map.addSource(`${prefix}-pulse`, { type: "geojson", data: EMPTY, lineMetrics: true });
+        map.addSource(`${prefix}-nodes`, { type: "geojson", data: EMPTY });
+      }
 
       /**
        * ルートの挿入位置。
@@ -200,164 +579,26 @@ export default function MapPane({
           (l) => l.type === "symbol" && (l.layout as Record<string, unknown> | undefined)?.["text-field"],
         )?.id ?? layers.find((l) => l.type === "symbol")?.id;
 
-      const color: maplibregl.ExpressionSpecification = [
-        "coalesce",
-        ["get", "color"],
-        MODE_COLOR.walk,
-      ];
-      const isWalk: maplibregl.FilterSpecification = ["==", ["get", "walk"], true];
-      const notWalk: maplibregl.FilterSpecification = ["!=", ["get", "walk"], true];
-
-      // 発光。ダークな UI 上でもルートが浮き上がる。
-      map.addLayer(
-        {
-          id: "route-glow",
-          type: "line",
-          source: "route",
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: {
-            "line-color": color,
-            "line-width": lineWidth(2.4),
-            "line-blur": 8,
-            "line-opacity": 0.35,
-          },
-        },
-        firstLabel,
-      );
-      // 車・徒歩以外の実線区間：白い縁取り + 本体
-      map.addLayer(
-        {
-          id: "route-casing",
-          type: "line",
-          source: "route",
-          filter: notWalk,
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: {
-            "line-color": "#ffffff",
-            "line-width": lineWidth(1, 5),
-            "line-opacity": 0.92,
-          },
-        },
-        firstLabel,
-      );
-      map.addLayer(
-        {
-          id: "route-line",
-          type: "line",
-          source: "route",
-          filter: notWalk,
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: { "line-color": color, "line-width": lineWidth() },
-        },
-        firstLabel,
-      );
-      // 徒歩区間：丸ドットの点線
-      map.addLayer(
-        {
-          id: "route-walk-halo",
-          type: "line",
-          source: "route",
-          filter: isWalk,
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: {
-            "line-color": "#ffffff",
-            "line-width": WALK_HALO_W,
-            "line-dasharray": WALK_HALO_DASH,
-            "line-opacity": 0.9,
-          },
-        },
-        firstLabel,
-      );
-      map.addLayer(
-        {
-          id: "route-walk",
-          type: "line",
-          source: "route",
-          filter: isWalk,
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: {
-            "line-color": color,
-            "line-width": WALK_W,
-            "line-dasharray": WALK_DASH,
-          },
-        },
-        firstLabel,
-      );
-      /**
-       * 進行方向に流れる光。尾に向かって透明にする（line-gradient は lineMetrics 必須）。
-       * 薄いハローと細い芯の2枚重ね。1枚だと路線カラーに埋もれて見えない。
-       */
-      map.addLayer(
-        {
-          id: "route-pulse-halo",
-          type: "line",
-          source: "route-pulse",
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: {
-            "line-width": lineWidth(2.1),
-            "line-blur": 5,
-            "line-gradient": [
-              "interpolate",
-              ["linear"],
-              ["line-progress"],
-              0,
-              "rgba(255,255,255,0)",
-              0.6,
-              "rgba(255,255,255,0.25)",
-              1,
-              "rgba(255,255,255,0.85)",
-            ],
-          },
-        },
-        firstLabel,
-      );
-      map.addLayer(
-        {
-          id: "route-pulse",
-          type: "line",
-          source: "route-pulse",
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: {
-            "line-width": lineWidth(0.62),
-            "line-blur": 0.6,
-            "line-gradient": [
-              "interpolate",
-              ["linear"],
-              ["line-progress"],
-              0,
-              "rgba(255,255,255,0)",
-              0.7,
-              "rgba(255,255,255,0.55)",
-              0.92,
-              "rgba(255,255,255,1)",
-              1,
-              "rgba(255,255,255,1)",
-            ],
-          },
-        },
-        firstLabel,
-      );
-      // 乗換駅・起終点
-      map.addLayer(
-        {
-          id: "route-nodes",
-          type: "circle",
-          source: "route-nodes",
-          paint: {
-            "circle-radius": ["case", ["==", ["get", "kind"], "end"], 6.5, 5],
-            "circle-color": "#ffffff",
-            "circle-stroke-width": 2.6,
-            "circle-stroke-color": ["coalesce", ["get", "color"], "#5f6b7a"],
-          },
-        },
-        firstLabel,
-      );
+      // plan を先に入れて route を後に入れる＝ route が上に乗る。
+      // いま聞いたことの答え（get_route）が、確定済みのプランに隠れないようにする。
+      for (const prefix of ["plan", "route"]) {
+        for (const spec of routeLayers(prefix)) map.addLayer(spec, firstLabel);
+        for (const spec of pulseLayers(prefix)) map.addLayer(spec, firstLabel);
+        map.addLayer(nodeLayer(prefix), firstLabel);
+      }
 
       ready.current = true;
     });
 
     // 地図の余白をクリックしたら選択解除
     map.on("click", () => onSelect(null));
+
+    // 引いた画では吹き出しを畳む。HTML マーカーは自動で衝突回避してくれないので自前で。
+    const syncBubbleZoom = () => {
+      const hide = map.getZoom() < BUBBLE_MIN_ZOOM;
+      for (const b of bubbles.current) b.getElement().classList.toggle("rb-hidden", hide);
+    };
+    map.on("zoom", syncBubbleZoom);
 
     // ペイン高さ・サイドリストの出入りで幅が変わったら resize（roadmap §1.5-2）
     const ro = new ResizeObserver(() => map.resize());
@@ -369,6 +610,7 @@ export default function MapPane({
       mapRef.current = null;
       ready.current = false;
       entries.current.clear();
+      bubbles.current = [];
     };
     // onSelect は page 側で useCallback 済み（ここで再初期化させない）
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -387,7 +629,7 @@ export default function MapPane({
     }
   }, [location]);
 
-  // --- ピン（検索結果 + 旅程） ------------------------------------------------
+  // --- ピン（検索結果 + プラン） ----------------------------------------------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -395,11 +637,25 @@ export default function MapPane({
     for (const e of entries.current.values()) e.marker.remove();
     entries.current.clear();
 
-    const add = (id: string, lngLat: [number, number], svg: string, html: string, cls: string) => {
+    const add = (
+      id: string,
+      lngLat: [number, number],
+      svg: string,
+      html: string,
+      cls: string,
+      badge?: string | null,
+    ) => {
       // maplibre は marker の element 自体に transform を当てるので、
       // 拡大用の transform は内側の要素に分けて持たせる。
       const wrap = document.createElement("div");
       wrap.className = "pin-wrap";
+      if (badge) {
+        // 到着予定時刻。ピンの真上に小さく載せる。
+        const b = document.createElement("div");
+        b.className = "pin-time";
+        b.textContent = badge;
+        wrap.appendChild(b);
+      }
       const inner = document.createElement("div");
       inner.className = cls;
       inner.innerHTML = svg;
@@ -417,7 +673,7 @@ export default function MapPane({
     const itinItems = itinerary?.days.flatMap((d) => d.items) ?? [];
     const itinIds = new Set(itinItems.map((i) => i.place_id));
 
-    // 検索結果：赤いピン（旅程に入っているものは番号ピン側で描くので除外）
+    // 検索結果：赤いピン（プランに入っているものは番号ピン側で描くので除外）
     for (const p of places) {
       if (itinIds.has(p.place_id)) continue;
       add(
@@ -435,18 +691,26 @@ export default function MapPane({
       );
     }
 
-    // 旅程：番号つきの琥珀ピン（roadmap §5 原則2「旅程に入っているかで描き分ける」）
+    // プラン：番号つきの琥珀ピン + 到着予定時刻（roadmap §5 原則2）
     itinItems.forEach((item, i) => {
+      const move = item.travel_from_previous;
       add(
         item.place_id,
         [item.lng, item.lat],
         pinSvg(ITIN_PIN, String(i + 1)),
         popupHtml(`${i + 1}. ${item.name}`, [
-          item.start_time ? `${item.start_time}〜` : "",
+          item.arrive_time
+            ? `${item.arrive_time} 着${item.depart_time ? ` / ${item.depart_time} 発` : ""}`
+            : "",
           item.duration_min ? `滞在 ${item.duration_min}分` : "",
+          move
+            ? `前の場所から ${MODE_LABEL[move.mode] ?? move.mode} ${fmtMin(move.duration_s)}・${fmtDist(move.distance_m)}` +
+              (move.elevation_gain_m ? `（登り +${move.elevation_gain_m}m）` : "")
+            : "",
           item.note ?? "",
         ]),
         "pin-place pin-itin",
+        item.arrive_time,
       );
     });
   }, [places, itinerary, onSelect]);
@@ -475,154 +739,118 @@ export default function MapPane({
     }
   }, [selectedId, places, itinerary]);
 
-  // --- ルート（区間ごとの描き分け + 描き出し + コメット） -------------------------
+  // --- プランの経路（常設。コメットは付けない） ---------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const apply = () => {
+      paintedPlan.current = paintRoute(map, "plan", itinerary?.legs ?? [], animPlan, {
+        comet: false,
+        animate: true,
+      });
+    };
+    if (ready.current) apply();
+    else map.once("load", apply);
+    return () => {
+      if (animPlan.current !== null) cancelAnimationFrame(animPlan.current);
+      animPlan.current = null;
+    };
+  }, [itinerary]);
+
+  // --- get_route の経路（使い捨て。こちらにコメットを付ける） ---------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const apply = () => {
+      paintedRoute.current = paintRoute(map, "route", route?.legs ?? [], animRoute, {
+        comet: true,
+        animate: true,
+      });
+    };
+    if (ready.current) apply();
+    else map.once("load", apply);
+    return () => {
+      if (animRoute.current !== null) cancelAnimationFrame(animRoute.current);
+      animRoute.current = null;
+    };
+  }, [route]);
+
+  // --- 経路の上の吹き出し ------------------------------------------------------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
-    const stop = () => {
-      if (anim.current !== null) cancelAnimationFrame(anim.current);
-      anim.current = null;
-    };
-
     const apply = () => {
-      const src = map.getSource("route") as maplibregl.GeoJSONSource | undefined;
-      const pulseSrc = map.getSource("route-pulse") as maplibregl.GeoJSONSource | undefined;
-      const nodeSrc = map.getSource("route-nodes") as maplibregl.GeoJSONSource | undefined;
-      if (!src || !pulseSrc || !nodeSrc) return;
+      for (const b of bubbles.current) b.remove();
+      bubbles.current = [];
 
-      stop();
-      if (!route) {
-        src.setData(EMPTY);
-        pulseSrc.setData(EMPTY);
-        nodeSrc.setData(EMPTY);
-        return;
+      // プラン側。総計には移動時間と累積標高を出す（滞在時間は含まない）。
+      if (itinerary && paintedPlan.current) {
+        const g = itinerary.total_elevation_gain_m;
+        bubbles.current.push(
+          ...makeBubbles(
+            map,
+            paintedPlan.current,
+            itinerary.legs,
+            "plan",
+            `合計 ${fmtDist(itinerary.total_distance_m)}・移動${fmtMin(itinerary.total_duration_s)}` +
+              (g !== null ? `・登り+${g}m` : ""),
+          ),
+        );
       }
 
-      // leg が線形を持っていない古い形にも耐える（ルート全体を1区間として扱う）
-      const legs =
-        route.legs.length > 0 && route.legs.some((l) => (l.polyline?.length ?? 0) >= 2)
-          ? route.legs.filter((l) => (l.polyline?.length ?? 0) >= 2)
-          : [
-              {
-                from: "",
-                to: "",
-                mode: route.mode,
-                distance_m: route.distance_m,
-                duration_s: route.duration_s,
-                note: null,
-                polyline: route.polyline,
-                operator: null,
-                line: null,
-                color: null,
-              },
-            ];
-
-      // leg ごとに chain を作り、ルート全体での開始距離を持たせる
-      let offset = 0;
-      const parts = legs.map((l) => {
-        const chain = chainOf(l.polyline as [number, number][]);
-        const start = offset;
-        offset += chain.total;
-        return {
-          chain,
-          start,
-          walk: l.mode === "walk",
-          color: l.color ?? MODE_COLOR[l.mode] ?? MODE_COLOR.walk,
-          mode: l.mode,
-          label: l.line ?? null,
-        };
-      });
-      const total = offset;
-
-      // 全体を繋いだ1本（コメットが leg 境界で途切れないように）
-      const whole: [number, number][] = [];
-      for (const p of parts) {
-        if (whole.length === 0) whole.push(...p.chain.pts);
-        else whole.push(...p.chain.pts.slice(1));
-      }
-      const wholeChain = chainOf(whole);
-
-      const featuresUpTo = (d: number): GeoJSON.FeatureCollection => ({
-        type: "FeatureCollection",
-        features: parts.flatMap((p) => {
-          const cut = Math.min(p.chain.total, d - p.start);
-          if (cut <= 0) return [];
-          const coords = cut >= p.chain.total ? p.chain.pts : slice(p.chain, 0, cut);
-          if (coords.length < 2) return [];
-          return [
-            {
-              type: "Feature" as const,
-              properties: { color: p.color, walk: p.walk, mode: p.mode, line: p.label },
-              geometry: { type: "LineString" as const, coordinates: coords },
-            },
-          ];
-        }),
-      });
-
-      // 乗換駅・起終点。鉄道が絡む境界だけ丸を打つ。
-      const nodes: GeoJSON.Feature[] = [];
-      const pushNode = (at: [number, number], kind: string, color: string, name: string) => {
-        nodes.push({
-          type: "Feature",
-          properties: { kind, color, name },
-          geometry: { type: "Point", coordinates: at },
-        });
-      };
-      if (parts.length > 0) {
-        pushNode(parts[0].chain.pts[0], "end", "#5f6b7a", "");
-        const last = parts[parts.length - 1].chain;
-        pushNode(last.pts[last.pts.length - 1], "end", "#5f6b7a", "");
-        for (let i = 1; i < parts.length; i++) {
-          if (parts[i - 1].mode !== "transit" && parts[i].mode !== "transit") continue;
-          const c = parts[i].mode === "transit" ? parts[i].color : parts[i - 1].color;
-          pushNode(parts[i].chain.pts[0], "transfer", c, legs[i].from);
-        }
+      // get_route 側。旧来の左上チップに出していた内容がそのままここに来る。
+      if (route && paintedRoute.current) {
+        bubbles.current.push(
+          ...makeBubbles(
+            map,
+            paintedRoute.current,
+            route.legs,
+            "route",
+            `合計 ${fmtDist(route.distance_m)}・${fmtMin(route.duration_s)}` +
+              (route.estimated_fare_jpy !== null ? `・約${route.estimated_fare_jpy.toLocaleString()}円` : "") +
+              (route.elevation_gain_m !== null ? `・登り+${route.elevation_gain_m}m` : ""),
+          ),
+        );
       }
 
-      const startPulse = () => {
-        const tail = Math.max(120, total * PULSE_TAIL);
-        const t0 = performance.now();
-        const frame = (now: number) => {
-          const phase = ((now - t0) % PULSE_MS) / PULSE_MS;
-          const head = phase * (total + tail);
-          const coords = slice(wholeChain, head - tail, head);
-          pulseSrc.setData(
-            coords.length >= 2
-              ? {
-                  type: "FeatureCollection",
-                  features: [
-                    { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: coords } },
-                  ],
-                }
-              : EMPTY,
-          );
-          anim.current = requestAnimationFrame(frame);
-        };
-        anim.current = requestAnimationFrame(frame);
-      };
-
-      // A: 始点から終点へ線を伸ばす。600〜800ms で1回だけ。
-      pulseSrc.setData(EMPTY);
-      nodeSrc.setData(EMPTY);
-      const t0 = performance.now();
-      const draw = (now: number) => {
-        const t = Math.min(1, (now - t0) / DRAW_MS);
-        src.setData(featuresUpTo(easeOutCubic(t) * total));
-        if (t < 1) {
-          anim.current = requestAnimationFrame(draw);
-          return;
-        }
-        nodeSrc.setData({ type: "FeatureCollection", features: nodes });
-        startPulse(); // B: 描き終わったらコメットに引き継ぐ
-      };
-      anim.current = requestAnimationFrame(draw);
+      const hide = map.getZoom() < BUBBLE_MIN_ZOOM;
+      for (const b of bubbles.current) b.getElement().classList.toggle("rb-hidden", hide);
     };
 
+    // paintRoute の描き出しアニメーションが終わってから出す（線より先に字が浮くと落ち着かない）。
+    // 初回はスタイルのロード待ちで paintRoute 自体が遅れるので、load を待ってから計り始める。
+    let t: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      t = setTimeout(apply, DRAW_MS + 40);
+    };
+    if (ready.current) schedule();
+    else map.once("load", schedule);
+
+    return () => {
+      if (t) clearTimeout(t);
+      for (const b of bubbles.current) b.remove();
+      bubbles.current = [];
+    };
+  }, [route, itinerary]);
+
+  // --- プランを薄くする（get_route の結果が上に乗っているとき） -------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const apply = () => {
+      const k = route ? PLAN_DIM : 1;
+      for (const [suffix, base] of Object.entries(BASE_OPACITY)) {
+        const id = `plan-${suffix}`;
+        if (map.getLayer(id)) map.setPaintProperty(id, "line-opacity", base * k);
+      }
+      if (map.getLayer("plan-nodes")) {
+        map.setPaintProperty("plan-nodes", "circle-opacity", k);
+        map.setPaintProperty("plan-nodes", "circle-stroke-opacity", k);
+      }
+    };
     if (ready.current) apply();
     else map.once("load", apply);
-
-    return stop;
   }, [route]);
 
   // --- カメラ：結果の bounds に fit（カメラ操作はツールにしない / §5 原則2） ------
@@ -632,6 +860,7 @@ export default function MapPane({
 
     const pts: [number, number][] = [];
     if (route) pts.push(...route.polyline);
+    for (const l of itinerary?.legs ?? []) pts.push(...l.polyline);
     for (const it of itinerary?.days.flatMap((d) => d.items) ?? []) pts.push([it.lng, it.lat]);
     for (const p of places) pts.push([p.lng, p.lat]);
     if (pts.length === 0) return;

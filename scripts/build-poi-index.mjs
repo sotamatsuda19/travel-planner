@@ -325,8 +325,22 @@ function bareKey(s) {
   return nameKey(stripped);
 }
 
+/**
+ * 「台東区立浅草文化観光センター」→「浅草文化観光センター」、
+ * 「一般財団法人 東武博物館」→「東武博物館」。
+ * 自治体データは設置者を冠した正式名称で載り、OSM は通称で載るので、
+ * これを外さないと同じ建物に2本ピンが立つ。
+ */
+function orgKey(s) {
+  const stripped = String(s)
+    .normalize("NFKC")
+    .replace(/^(公益財団法人|一般財団法人|公益社団法人|一般社団法人|独立行政法人|特定非営利活動法人|国立大学法人|社会福祉法人|学校法人)\s*/, "")
+    .replace(/^(東京都|[^\s]{1,5}[区市町村])立\s*/, "");
+  return bareKey(stripped);
+}
+
 function indexName(rec) {
-  for (const k of new Set([nameKey(rec.name), bareKey(rec.name)])) {
+  for (const k of new Set([nameKey(rec.name), bareKey(rec.name), orgKey(rec.name)])) {
     if (!k) continue;
     if (!byName.has(k)) byName.set(k, []);
     byName.get(k).push(rec);
@@ -359,7 +373,7 @@ const metersBetween = (aLat, aLon, bLat, bLon) => {
  * 名前だけで繋ぐと「セブンイレブン」が全部1件になるので、距離の上限は必ず要る。
  */
 function findExisting(name, lat, lon, maxM = 400) {
-  for (const key of new Set([nameKey(name), bareKey(name)])) {
+  for (const key of new Set([nameKey(name), bareKey(name), orgKey(name)])) {
     if (!key) continue;
     const cands = byName.get(key);
     if (!cands) continue;

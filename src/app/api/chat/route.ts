@@ -58,6 +58,7 @@ export async function POST(req: Request) {
   const location = body.location ?? FALLBACK_LOCATION;
 
   const ctx: TurnContext = {
+    sessionId,
     location,
     now: new Date(),
     weather: await tokyoWeather(),
