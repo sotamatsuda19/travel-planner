@@ -1,5 +1,53 @@
 export type LatLng = { lat: number; lng: number };
 
+/**
+ * 「だれが実際にその場所を使えるか」。
+ * 出所は OSM のタグ / 東京都「だれでも東京」/ 東京都 飲食店バリアフリー情報 の3つ。
+ *
+ * **キーが無いことと false は意味が違う**。無い＝調べられていない、false＝設備が無い。
+ * 条件検索は「true のものだけ」を通す。調査されていない場所を「無い」扱いにすると、
+ * データの薄い店ほど不利になって、結果が実態とずれる。
+ */
+export type Accessibility = {
+  /** yes=車椅子で利用可 / limited=一部可・介助が要るかもしれない / no=不可 */
+  wheelchair?: "yes" | "limited" | "no";
+  /** 入口に段差が無い */
+  step_free?: boolean;
+  step_height_cm?: number;
+  entrance_width_cm?: number;
+  slope?: boolean;
+  auto_door?: boolean;
+  elevator?: boolean;
+  /** 車椅子対応トイレ／だれでもトイレ */
+  accessible_toilet?: boolean;
+  accessible_toilet_count?: number;
+  ostomate?: boolean;
+  /** おむつ替え台 */
+  changing_table?: boolean;
+  nursing_room?: boolean;
+  tactile_paving?: boolean;
+  braille_map?: boolean;
+  braille_menu?: boolean;
+  sign_language?: boolean;
+  writing_support?: boolean;
+  flash_bell?: boolean;
+  wheelchair_rental?: boolean;
+  stroller_rental?: boolean;
+  assistance_dog?: boolean;
+  accessible_parking?: boolean;
+  movable_chairs?: boolean;
+  table_clearance?: boolean;
+  photo_menu?: boolean;
+  multilingual_menu?: boolean;
+  allergy?: boolean;
+  vegetarian?: boolean;
+  halal?: boolean;
+  free_toilet?: boolean;
+  unisex_toilet?: boolean;
+  /** この情報自体の出典 */
+  src?: string;
+};
+
 /** 検索インデックスの1レコード（data/poi.jsonl） */
 export type PoiRecord = {
   id: string;
@@ -16,6 +64,9 @@ export type PoiRecord = {
   phone: string | null;
   desc: string | null;
   source: string;
+  access: Accessibility | null;
+  /** true なら座標は住所からの推定（街区〜町丁目の代表点）で、建物のピンポイントではない */
+  approx?: boolean;
   /** 正規化済み検索テキスト */
   s: string;
 };
@@ -34,6 +85,9 @@ export type Place = {
   website: string | null;
   distance_m: number | null;
   source: string;
+  accessibility: Accessibility | null;
+  /** 座標が住所からの推定であることを地図・文章の両方で断るためのフラグ */
+  approx_location: boolean;
 };
 
 export type RouteLeg = {

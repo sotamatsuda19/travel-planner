@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
-import type { LatLng, Place, PoiRecord } from "./types";
+import type { Accessibility, LatLng, Place, PoiRecord } from "./types";
 
 /**
  * POI インデックス（オープンデータ由来）のロードと検索。
@@ -181,6 +181,52 @@ export function isOpenNow(spec: string | null, now: Date): boolean | null {
 
 // -------------------------------------------------------------------- 検索
 
+/**
+ * search_places の `require` で指定できる条件。
+ * Accessibility のキーそのままではなく、「利用者が言う言葉」の単位でまとめてある
+ * （例: wheelchair は wheelchair タグと step_free のどちらでも満たされる）。
+ */
+export const ACCESS_REQUIREMENTS = [
+  "wheelchair",
+  "step_free",
+  "elevator",
+  "accessible_toilet",
+  "ostomate",
+  "changing_table",
+  "nursing_room",
+  "tactile_paving",
+  "braille",
+  "sign_language",
+  "writing_support",
+  "wheelchair_rental",
+  "stroller_rental",
+  "assistance_dog",
+  "accessible_parking",
+  "multilingual_menu",
+  "allergy",
+  "vegetarian",
+  "halal",
+] as const;
+
+export type AccessRequirement = (typeof ACCESS_REQUIREMENTS)[number];
+
+/** 1つの要件を満たすか。**分かっていない項目は満たさない扱い**（false ではなく未調査でも落とす）。 */
+function satisfies(a: Accessibility | null, req: AccessRequirement): boolean {
+  if (!a) return false;
+  switch (req) {
+    case "wheelchair":
+      // 「段差が無い」だけでも実用上は通れる。ただし wheelchair=no は明確な否定なので優先する。
+      if (a.wheelchair === "no") return false;
+      return a.wheelchair === "yes" || a.step_free === true;
+    case "step_free":
+      return a.step_free === true || a.slope === true;
+    case "braille":
+      return a.braille_map === true || a.braille_menu === true || a.tactile_paving === true;
+    default:
+      return a[req] === true;
+  }
+}
+
 export type SearchArgs = {
   query: string;
   near?: LatLng | null;
@@ -188,6 +234,8 @@ export type SearchArgs = {
   radiusM?: number;
   limit?: number;
   openNow?: boolean;
+  /** 全部満たすものだけを返す（AND 条件） */
+  require?: AccessRequirement[];
   now?: Date;
 };
 
@@ -206,6 +254,8 @@ export function toPlace(rec: PoiRecord, origin: LatLng | null, now: Date): Place
     website: rec.website,
     distance_m: distance,
     source: rec.source,
+    accessibility: rec.access ?? null,
+    approx_location: rec.approx === true,
   };
 }
 
@@ -215,6 +265,8 @@ export function searchPlaces(args: SearchArgs): { places: Place[]; center: LatLn
   const limit = Math.min(args.limit ?? 8, 20);
   const radius = args.radiusM ?? 2500;
   const origin = args.near ?? null;
+
+  const req = args.require ?? [];
 
   const q = normalize(args.query);
   const tokens = q.split(" ").filter((t) => t.length > 0);
@@ -245,6 +297,11 @@ export function searchPlaces(args: SearchArgs): { places: Place[]; center: LatLn
       const open = isOpenNow(rec.hours, now);
       if (open === false) continue;
       if (open === true) score += 1;
+    }
+    if (req.length) {
+      if (!req.every((r) => satisfies(rec.access, r))) continue;
+      // 調査が新しく詳しいもの（都のバリアフリー調査）を上に出す
+      score += Object.keys(rec.access ?? {}).length * 0.2;
     }
     if (rec.desc) score += 1.5; // 説明文（Wikidata/Wikivoyage）があるものを優先
     if (rec.website) score += 0.3;

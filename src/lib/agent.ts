@@ -1,7 +1,16 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { getPlace, haversine, nearestStation, resolveArea, searchPlaces, toPlace } from "./poi";
+import {
+  ACCESS_REQUIREMENTS,
+  getPlace,
+  haversine,
+  nearestStation,
+  resolveArea,
+  searchPlaces,
+  toPlace,
+} from "./poi";
 import { buildRoute } from "./route";
-import type { Itinerary, LatLng, Place, RouteResult, TravelMode } from "./types";
+import type { AccessRequirement } from "./poi";
+import type { Accessibility, Itinerary, LatLng, Place, RouteResult, TravelMode } from "./types";
 
 export const MODEL = "claude-opus-5";
 
@@ -11,9 +20,11 @@ export const TOOLS: Anthropic.Tool[] = [
   {
     name: "search_places",
     description:
-      "東京のスポット（飲食店・観光地・公園・神社仏閣・美術館・駅・公衆トイレなど）をオープンデータから検索する。" +
+      "東京のスポット（飲食店・観光地・公園・神社仏閣・美術館・駅・ホテル・簡易宿所・公衆トイレなど）を" +
+      "オープンデータから検索する。" +
       "結果は自動的に地図にピンとして表示されるので、返ってきた場所を文章で列挙し直す必要はない。" +
-      "カテゴリ違いの候補が欲しいときは複数回まとめて呼んでよい（例: カフェ / レストラン / 夜景）。",
+      "カテゴリ違いの候補が欲しいときは複数回まとめて呼んでよい（例: カフェ / レストラン / 夜景）。" +
+      "車椅子・ベビーカー・食事制限などの条件があるときは require で絞る。",
     strict: true,
     input_schema: {
       type: "object",
@@ -35,8 +46,23 @@ export const TOOLS: Anthropic.Tool[] = [
           type: ["boolean", "null"],
           description: "true なら現在営業中と判定できる店に絞る（営業時間データが無い店は除外しない）。",
         },
+        require: {
+          type: ["array", "null"],
+          items: { type: "string", enum: [...ACCESS_REQUIREMENTS] },
+          description:
+            "バリアフリー・受入対応の必須条件。指定を全部満たす場所だけが返る（AND）。" +
+            "wheelchair=車椅子で入れる / step_free=入口に段差なし / elevator=エレベーター / " +
+            "accessible_toilet=車椅子対応トイレ / ostomate=オストメイト対応 / changing_table=おむつ替え台 / " +
+            "nursing_room=授乳室 / tactile_paving=点字ブロック / braille=点字案内 / " +
+            "sign_language=手話対応スタッフ / writing_support=筆談対応 / " +
+            "wheelchair_rental=車椅子貸出 / stroller_rental=ベビーカー貸出 / assistance_dog=補助犬受入 / " +
+            "accessible_parking=車椅子用駐車場 / multilingual_menu=外国語メニュー / " +
+            "allergy=アレルギー対応 / vegetarian=ベジタリアン対応 / halal=ハラール対応。" +
+            "**調査済みの場所しか通らない**ので、条件を足すほど件数は大きく減る。" +
+            "0件のときは条件を1つ外して呼び直すこと。不要なら null。",
+        },
       },
-      required: ["query", "near_area", "radius_m", "limit", "open_now"],
+      required: ["query", "near_area", "radius_m", "limit", "open_now", "require"],
       additionalProperties: false,
     },
   },
@@ -129,6 +155,7 @@ export const SYSTEM_PROMPT = `あなたは東京の旅行・おでかけプラ�
 
 ## ツールの使い分け
 - search_places … 場所を探す。カテゴリが複数あるなら並列に複数回呼ぶ。
+  車椅子・ベビーカー・食事制限などの条件が出たら require で絞る。
 - get_route … 経路・所要時間・タクシー料金・坂道のきつさ（累積標高）を出す。移動手段の比較は mode を変えて複数回。
 - save_itinerary … 旅程の保存。**常に全体を丸ごと**渡す（差分更新はしない）。
 
@@ -141,9 +168,31 @@ export const SYSTEM_PROMPT = `あなたは東京の旅行・おでかけプラ�
 - 曖昧なときは、選択肢を2〜3個示して聞き返す。長い質問リストにしない。
 - 予算・好み・帰る方面などは事前に分からない。必要になった時点で、会話の流れの中で1つずつ聞く。
 - 提案には必ず理由を添える（近い／評判／今開いている／坂が少ない／説明文がある など）。
-- データはオープンデータ（OpenStreetMap・Wikidata・Wikivoyage・国土地理院・気象庁）由来。
+- データはオープンデータ（OpenStreetMap・Wikidata・Wikivoyage・国土地理院・気象庁・
+  東京都および区市町村のオープンデータ）由来。
   営業時間や料金は概算であることを、断定を避けた言い方で示す。
-- 終電・タクシー・帰り道の相談では、まず「今どうすれば帰れるか」を最初の1文で答える。`;
+- 終電・タクシー・帰り道の相談では、まず「今どうすれば帰れるか」を最初の1文で答える。
+
+## バリアフリー・子連れ・食事制限の相談
+このアプリの強みはここにある。東京都「だれでも東京」と都の飲食店バリアフリー調査、
+区の旅館業許可台帳、OpenStreetMap のタグを突き合わせて持っている。地図アプリには無い情報。
+
+- 「車椅子で」「ベビーカーで」「母を連れて」「祖父と」のような話が出たら、
+  **聞き返す前にまず require つきで検索する**。何が実際にあるか見てから確認する方が早い。
+- 検索結果に含まれるバリアフリー情報は**そのまま数字で伝える**。
+  「段差なし」「入口幅90cm」「多目的トイレ2か所」は、言い換えるより具体的な方が役に立つ。
+- **調査済みの場所しか require を通らない**。0件は「無い」ではなく「確認できていない」。
+  そのときは条件を減らして呼び直し、「データで確認できた範囲では」と断って出す。
+- 徒歩ルートの累積標高（get_route）は、車椅子・ベビーカー・高齢者の相談では
+  疲労度ではなく**通れるかどうか**の話になる。この文脈では必ず添える。
+- 情報には調査時点がある。「都の調査では〜となっています。心配なら電話で確認を」まで言う。
+  設備の有無を断定して、行った先で入れなかった、が一番まずい。
+
+## 宿泊
+区の旅館業許可台帳（旅館・ホテル営業／簡易宿所営業）と OSM を持っている。
+- 台帳は許可情報であって、営業中とも予約可能とも限らない。空室・料金は分からない。
+- 台帳の一部は住所から座標を推定している（結果に「位置は住所からの推定」と出る）。
+  その場合は地図のピンが建物とずれることを一言添える。`;
 
 // -------------------------------------------------------------- 毎ターンの文脈
 
@@ -197,6 +246,57 @@ export function renderContext(ctx: TurnContext): string {
 
 // ------------------------------------------------------------------ ツール実行
 
+/**
+ * バリアフリー情報を1行にたたむ。
+ * 「調べた上で無かった」項目まで並べると読めなくなるので、true と数値だけを出し、
+ * 明確な否定（wheelchair=no）だけ例外的に書く。
+ */
+const ACCESS_LABELS: [keyof Accessibility, string][] = [
+  ["step_free", "入口に段差なし"],
+  ["slope", "スロープあり"],
+  ["auto_door", "自動ドア"],
+  ["elevator", "エレベーターあり"],
+  ["accessible_toilet", "車椅子対応トイレあり"],
+  ["ostomate", "オストメイト対応"],
+  ["changing_table", "おむつ替え台あり"],
+  ["nursing_room", "授乳室あり"],
+  ["tactile_paving", "点字ブロックあり"],
+  ["braille_map", "点字案内あり"],
+  ["braille_menu", "点字メニューあり"],
+  ["sign_language", "手話対応スタッフ"],
+  ["writing_support", "筆談対応"],
+  ["flash_bell", "フラッシュベル貸出"],
+  ["wheelchair_rental", "車椅子貸出"],
+  ["stroller_rental", "ベビーカー貸出"],
+  ["assistance_dog", "補助犬受入設備"],
+  ["accessible_parking", "車椅子用駐車場"],
+  ["movable_chairs", "椅子が可動"],
+  ["table_clearance", "テーブル下にスペース"],
+  ["photo_menu", "写真メニュー"],
+  ["multilingual_menu", "外国語メニュー"],
+  ["allergy", "アレルギー対応（要事前申請）"],
+  ["vegetarian", "ベジタリアン/ヴィーガン対応（要事前申請）"],
+  ["halal", "ハラール対応（要事前申請）"],
+  ["free_toilet", "無料"],
+];
+
+function describeAccess(a: Accessibility | null): string | null {
+  if (!a) return null;
+  const bits: string[] = [];
+  if (a.wheelchair === "yes") bits.push("車椅子で利用可");
+  else if (a.wheelchair === "limited") bits.push("車椅子は一部のみ可");
+  else if (a.wheelchair === "no") bits.push("車椅子では利用不可");
+
+  for (const [key, label] of ACCESS_LABELS) {
+    if (a[key] === true) bits.push(label);
+  }
+  if (a.step_height_cm) bits.push(`段差${a.step_height_cm}cm`);
+  if (a.entrance_width_cm) bits.push(`入口幅${a.entrance_width_cm}cm`);
+  if (a.accessible_toilet_count) bits.push(`対応トイレ${a.accessible_toilet_count}か所`);
+  if (!bits.length) return null;
+  return `${bits.join("・")}${a.src ? `（${a.src}）` : ""}`;
+}
+
 export type ToolOutcome = {
   /** LLM に返す内容（テキスト） */
   content: string;
@@ -233,12 +333,19 @@ export async function runTool(
       radiusM: (input.radius_m as number | null) ?? undefined,
       limit: (input.limit as number | null) ?? undefined,
       openNow: (input.open_now as boolean | null) ?? false,
+      require: (input.require as AccessRequirement[] | null) ?? undefined,
       now: ctx.now,
     });
 
     if (places.length === 0) {
       return {
-        content: `「${query}」${nearArea ? `（${nearArea}周辺）` : "（現在地周辺）"}では該当する場所が見つかりませんでした。別の言い方か、範囲を広げて再検索してください。`,
+        content:
+          `「${query}」${nearArea ? `（${nearArea}周辺）` : "（現在地周辺）"}では該当する場所が見つかりませんでした。` +
+          (Array.isArray(input.require) && input.require.length
+            ? `条件（${(input.require as string[]).join(", ")}）を満たすと確認できたスポットが範囲内に無い、` +
+              "というだけで、実際には条件を満たす場所がある可能性が高い。" +
+              "条件を1つ減らすか範囲を広げて呼び直し、ユーザーには「データで確認できた範囲では」と断ること。"
+            : "別の言い方か、範囲を広げて再検索してください。"),
         places: { query, places: [] },
       };
     }
@@ -252,6 +359,8 @@ export async function runTool(
         p.opening_hours ? `営業時間: ${p.opening_hours}` : null,
         p.is_open_now === true ? "現在営業中" : p.is_open_now === false ? "現在は営業時間外" : null,
         p.description ? `説明: ${p.description}` : null,
+        describeAccess(p.accessibility) ? `バリアフリー: ${describeAccess(p.accessibility)}` : null,
+        p.approx_location ? "※位置は住所からの推定（街区の代表点）で建物ピンポイントではない" : null,
         p.website ? `web: ${p.website}` : null,
         `出典: ${p.source}`,
       ].filter(Boolean);
