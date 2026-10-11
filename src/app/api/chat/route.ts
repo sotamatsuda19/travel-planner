@@ -41,6 +41,12 @@ export async function POST(req: Request) {
     return new Response("invalid json", { status: 400 });
   }
 
+  // 公開デモではチャットを止めておく（API クレジット保護）。CHAT_ENABLED=1 のときだけパイプラインを動かす。
+  // インデックスの読み込みより前に返すので、停止中はメモリも食わない。
+  if (process.env.CHAT_ENABLED !== "1") {
+    return sseNotice(CHAT_DISABLED_MESSAGE);
+  }
+
   if (!process.env.ANTHROPIC_API_KEY) {
     return sseError(
       "ANTHROPIC_API_KEY が設定されていません。travel-planner/.env.local に設定して開発サーバを再起動してください。",
@@ -218,6 +224,19 @@ function summarize(tu: Anthropic.ToolUseBlock): string {
     return `プラン「${input.title}」の経路と到着時刻を計算中${stops ? `（${stops}か所）` : ""}…`;
   }
   return `${tu.name} を実行中…`;
+}
+
+const CHAT_DISABLED_MESSAGE =
+  "現在、このデモではチャット機能を停止しています。\n" +
+  "仕組みやソースコード、ローカルでの動かし方は GitHub をご覧ください。\n" +
+  "https://github.com/sotamatsuda19/travel-planner";
+
+/** モデルを呼ばずに、アシスタントの吹き出しとして固定文を1つ返す */
+function sseNotice(message: string) {
+  const body = `data: ${JSON.stringify({ type: "text", delta: message })}\n\ndata: ${JSON.stringify({ type: "done" })}\n\n`;
+  return new Response(body, {
+    headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
+  });
 }
 
 function sseError(message: string) {
